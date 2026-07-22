@@ -1,0 +1,6 @@
+Plaintext
+
+flask
+flask-cors
+yfinance
+gunicorn
