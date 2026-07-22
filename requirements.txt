@@ -1,5 +1,3 @@
-Plaintext
-
 flask
 flask-cors
 yfinance
