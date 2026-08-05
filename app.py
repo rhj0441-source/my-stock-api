@@ -2,16 +2,13 @@ import os
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import yfinance as yf
-import requests
+from curl_cffi import requests as requests_cffi
 
 app = Flask(__name__)
 CORS(app)
 
-# 야후 차단 방지를 위한 브라우저 헤더 설정
-session = requests.Session()
-session.headers.update({
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-})
+# 차단 우회를 위한 브라우저 세션 생성 (Chrome 브라우저 위장)
+session = requests_cffi.Session(impersonate="chrome110")
 
 @app.route('/api/stock')
 def get_stock():
@@ -24,27 +21,20 @@ def get_stock():
         symbol += ".KS"
 
     try:
+        # 우회 세션 적용
         ticker = yf.Ticker(symbol, session=session)
-        
-        # 차단율이 가장 적은 fast_info 활용
         fast_info = ticker.fast_info
         
         current_price = fast_info.last_price
         previous_close = fast_info.previous_close
         
-        if current_price is None or previous_close is None:
-            # fast_info 실패 시 일반 info 시도
-            info = ticker.info
-            current_price = info.get('currentPrice') or info.get('regularMarketPrice')
-            previous_close = info.get('previousClose')
-
         if current_price is None:
-            raise ValueError("주식 데이터를 가져올 수 없습니다.")
+            raise ValueError("데이터 없음")
 
         change = current_price - previous_close if previous_close else 0
         change_percent = (change / previous_close) * 100 if previous_close else 0
 
-        # 최근 차트 데이터 (1개월)
+        # 최근 1개월 차트 데이터
         history = ticker.history(period="1mo")
         chart_data = [
             {"date": date.strftime('%Y-%m-%d'), "close": round(row['Close'], 2)}
