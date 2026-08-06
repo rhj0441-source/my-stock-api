@@ -5,3 +5,4 @@ gunicorn
 pandas
 requests
 curl_cffi
+FinanceDataReader
