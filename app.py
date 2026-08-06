@@ -17,8 +17,11 @@ _PERIOD_DAYS = {'1mo': 45, '1y': 380, '5y': 1900}
 
 # ---------------------------------------------------------
 # KRX(한국거래소) 종목코드 -> 종목명 캐시 (국내 주식/ETF 이름 조회용)
+# 코스닥 종목은 야후 파이낸스에서 심볼 뒤에 '.KQ'를 붙여야 하므로
+# 시장구분(코스피/코스닥)도 함께 캐싱해둔다.
 # ---------------------------------------------------------
 _krx_name_cache = {}
+_krx_market_cache = {}  # {'035720': 'KOSDAQ', ...} (코스닥 종목만 채워짐)
 _krx_cache_lock = threading.Lock()
 _krx_cache_updated_at = 0
 _KRX_CACHE_TTL = 6 * 60 * 60  # 6시간마다 갱신
@@ -26,7 +29,7 @@ _KRX_CACHE_TTL = 6 * 60 * 60  # 6시간마다 갱신
 
 def get_krx_name_map():
     """{'005930': '삼성전자', ...} 형태의 딕셔너리를 반환 (캐시됨)"""
-    global _krx_name_cache, _krx_cache_updated_at
+    global _krx_name_cache, _krx_market_cache, _krx_cache_updated_at
     now = time.time()
 
     if _krx_name_cache and (now - _krx_cache_updated_at) < _KRX_CACHE_TTL:
@@ -40,27 +43,39 @@ def get_krx_name_map():
         try:
             import FinanceDataReader as fdr
             new_map = {}
+            new_market_map = {}
 
             df_stock = fdr.StockListing('KRX')
-            new_map.update(
-                dict(zip(df_stock['Code'].astype(str).str.zfill(6), df_stock['Name']))
-            )
+            codes = df_stock['Code'].astype(str).str.zfill(6)
+            new_map.update(dict(zip(codes, df_stock['Name'])))
+            if 'Market' in df_stock.columns:
+                new_market_map.update(dict(zip(codes, df_stock['Market'])))
 
             try:
                 df_etf = fdr.StockListing('ETF/KR')
                 new_map.update(
                     dict(zip(df_etf['Symbol'].astype(str).str.zfill(6), df_etf['Name']))
                 )
+                # ETF는 대부분 코스피(.KS) 표기이므로 시장구분은 별도로 안 채움
             except Exception as e_etf:
                 print(f"[ETF 목록 캐시 갱신 실패] {e_etf}")
 
             if new_map:
                 _krx_name_cache = new_map
+                _krx_market_cache = new_market_map
                 _krx_cache_updated_at = now
         except Exception as e:
             print(f"[KRX 종목명 캐시 갱신 실패] {e}")
 
         return _krx_name_cache
+
+
+def get_yahoo_suffix(code: str) -> str:
+    """국내 종목 코드에 붙일 야후 파이낸스 접미사를 시장구분에 따라 결정.
+    코스닥이면 '.KQ', 그 외(코스피/ETF 등)는 '.KS'."""
+    get_krx_name_map()  # 캐시 예열 보장
+    market = _krx_market_cache.get(code, '')
+    return '.KQ' if market == 'KOSDAQ' else '.KS'
 
 
 # ---------------------------------------------------------
@@ -128,9 +143,44 @@ def resolve_period(raw: str) -> str:
     return p if p in _PERIOD_DAYS else '1mo'
 
 
+def fetch_yahoo_quote(yahoo_symbol: str, period: str) -> dict:
+    """야후 파이낸스에서 가격/차트/52주 고저/시가총액 등을 조회.
+    name은 포함하지 않음 (호출부에서 소스에 맞게 채움)."""
+    ticker = yf.Ticker(yahoo_symbol, session=session)
+    fast_info = ticker.fast_info
+
+    current_price = fast_info.last_price
+    previous_close = fast_info.previous_close
+
+    if current_price is None:
+        raise ValueError("데이터 없음")
+
+    change = current_price - previous_close if previous_close else 0
+    change_percent = (change / previous_close) * 100 if previous_close else 0
+
+    history = ticker.history(period=period)
+    chart_data = [
+        {"date": date.strftime('%Y-%m-%d'), "close": round(row['Close'], 2)}
+        for date, row in history.iterrows()
+    ]
+
+    return {
+        'currentPrice': current_price,
+        'previousClose': previous_close,
+        'change': change,
+        'changePercent': change_percent,
+        'currency': fast_info.currency or 'USD',
+        'high52': fast_info.year_high,
+        'low52': fast_info.year_low,
+        'marketCap': fast_info.market_cap,
+        'chart': chart_data,
+        '_ticker': ticker,  # 이름 조회에 재사용 (응답에는 포함하지 않음)
+    }
+
+
 # ---------------------------------------------------------
-# 국내 주식/ETF 전용: KRX 데이터(FinanceDataReader)만 사용
-# 프론트엔드가 6자리 숫자 코드일 때 이 엔드포인트를 호출한다.
+# 국내 주식/ETF 전용: 종목명은 KRX 캐시에서, 나머지 시세 정보는
+# 전부 야후 파이낸스에서 가져온다.
 # ---------------------------------------------------------
 @app.route('/api/kr-stock')
 def get_kr_stock():
@@ -145,43 +195,16 @@ def get_kr_stock():
     if cached:
         return jsonify(cached)
 
+    yahoo_symbol = code + get_yahoo_suffix(code)
+
     try:
-        import datetime
-        import FinanceDataReader as fdr
-
-        days = _PERIOD_DAYS[period]
-        end = datetime.date.today()
-        start = end - datetime.timedelta(days=days)
-        df = fdr.DataReader(code, start.isoformat(), end.isoformat())
-
-        if df is None or df.empty:
-            raise ValueError("데이터 없음")
-
-        last_row = df.iloc[-1]
-        prev_row = df.iloc[-2] if len(df) > 1 else last_row
-
-        current_price = float(last_row['Close'])
-        previous_close = float(prev_row['Close'])
-        change = current_price - previous_close
-        change_percent = (change / previous_close) * 100 if previous_close else 0
-
-        chart_data = [
-            {"date": idx.strftime('%Y-%m-%d'), "close": round(float(row['Close']), 2)}
-            for idx, row in df.iterrows()
-        ]
+        quote = fetch_yahoo_quote(yahoo_symbol, period)
+        quote.pop('_ticker', None)
 
         result = {
             'symbol': code,
-            'name': get_krx_name_map().get(code),
-            'currentPrice': current_price,
-            'previousClose': previous_close,
-            'change': change,
-            'changePercent': change_percent,
-            'currency': 'KRW',
-            'high52': float(df['High'].max()),
-            'low52': float(df['Low'].min()),
-            'marketCap': None,
-            'chart': chart_data
+            'name': get_krx_name_map().get(code),  # 종목명만 KRX 캐시에서
+            **quote,
         }
         set_cached_stock(cache_key, result)
         return jsonify(result)
@@ -194,7 +217,7 @@ def get_kr_stock():
 
 
 # ---------------------------------------------------------
-# 해외 주식/ETF 전용: 야후 파이낸스(yfinance)만 사용
+# 해외 주식/ETF 전용: 종목명, 시세 모두 야후 파이낸스에서 가져온다.
 # 프론트엔드가 6자리 숫자가 아닌 티커(AAPL, KRW=X 등)일 때 이 엔드포인트를 호출한다.
 # ---------------------------------------------------------
 @app.route('/api/global-stock')
@@ -211,36 +234,13 @@ def get_global_stock():
         return jsonify(cached)
 
     try:
-        ticker = yf.Ticker(symbol, session=session)
-        fast_info = ticker.fast_info
-
-        current_price = fast_info.last_price
-        previous_close = fast_info.previous_close
-
-        if current_price is None:
-            raise ValueError("데이터 없음")
-
-        change = current_price - previous_close if previous_close else 0
-        change_percent = (change / previous_close) * 100 if previous_close else 0
-
-        history = ticker.history(period=period)
-        chart_data = [
-            {"date": date.strftime('%Y-%m-%d'), "close": round(row['Close'], 2)}
-            for date, row in history.iterrows()
-        ]
+        quote = fetch_yahoo_quote(symbol, period)
+        ticker = quote.pop('_ticker')
 
         result = {
             'symbol': symbol,
             'name': get_foreign_name(symbol, ticker),
-            'currentPrice': current_price,
-            'previousClose': previous_close,
-            'change': change,
-            'changePercent': change_percent,
-            'currency': fast_info.currency or 'USD',
-            'high52': fast_info.year_high,
-            'low52': fast_info.year_low,
-            'marketCap': fast_info.market_cap,
-            'chart': chart_data
+            **quote,
         }
         set_cached_stock(cache_key, result)
         return jsonify(result)
