@@ -60,6 +60,49 @@ def get_korean_name(symbol: str):
     return get_krx_name_map().get(code)
 
 
+def get_kr_stock_via_fdr(code: str):
+    """
+    국내 종목(6자리 코드)의 시세를 야후가 아니라 KRX 공식 데이터를 쓰는
+    FinanceDataReader로 직접 조회. 야후 쪽 요청 제한(Too Many Requests)의
+    영향을 받지 않아 국내 종목 조회가 훨씬 안정적이다.
+    """
+    import datetime
+    import FinanceDataReader as fdr
+
+    end = datetime.date.today()
+    start = end - datetime.timedelta(days=370)  # 52주 고가/저가 계산용
+    df = fdr.DataReader(code, start.isoformat(), end.isoformat())
+
+    if df is None or df.empty:
+        raise ValueError("데이터 없음")
+
+    last_row = df.iloc[-1]
+    prev_row = df.iloc[-2] if len(df) > 1 else last_row
+
+    current_price = float(last_row['Close'])
+    previous_close = float(prev_row['Close'])
+    change = current_price - previous_close
+    change_percent = (change / previous_close) * 100 if previous_close else 0
+
+    recent = df.tail(30)  # 최근 1개월치 차트
+    chart_data = [
+        {"date": idx.strftime('%Y-%m-%d'), "close": round(float(row['Close']), 2)}
+        for idx, row in recent.iterrows()
+    ]
+
+    return {
+        'currentPrice': current_price,
+        'previousClose': previous_close,
+        'change': change,
+        'changePercent': change_percent,
+        'currency': 'KRW',
+        'high52': float(df['High'].max()),
+        'low52': float(df['Low'].min()),
+        'marketCap': None,  # FDR 개별 종목 조회에는 시가총액이 없음
+        'chart': chart_data
+    }
+
+
 # ---------------------------------------------------------
 # 종목별 시세 조회 결과 캐시
 # 같은 종목을 짧은 시간 안에 반복 조회할 때 야후 파이낸스에
@@ -97,6 +140,22 @@ def get_stock():
     if cached:
         return jsonify(cached)
 
+    code = symbol.split('.')[0]
+    is_kr_stock = code.isdigit() and len(code) == 6
+    korean_name = get_korean_name(symbol) if is_kr_stock else None
+
+    # 국내 종목은 KRX 공식 데이터(FinanceDataReader)를 우선 사용.
+    # 야후를 거치지 않으므로 'Too Many Requests' 문제 자체를 피한다.
+    if is_kr_stock:
+        try:
+            price_data = get_kr_stock_via_fdr(code)
+            result = {'symbol': symbol, 'name': korean_name, **price_data}
+            set_cached_stock(symbol, result)
+            return jsonify(result)
+        except Exception as e:
+            print(f"[FDR 조회 실패, 야후로 폴백] {symbol}: {e}")
+            # 아래 야후 경로로 폴백
+
     try:
         # 우회 세션 적용
         ticker = yf.Ticker(symbol, session=session)
@@ -117,8 +176,6 @@ def get_stock():
             {"date": date.strftime('%Y-%m-%d'), "close": round(row['Close'], 2)}
             for date, row in history.iterrows()
         ]
-
-        korean_name = get_korean_name(symbol)
 
         result = {
             'symbol': symbol,
