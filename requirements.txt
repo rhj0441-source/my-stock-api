@@ -6,3 +6,8 @@ pandas
 requests
 curl_cffi
 FinanceDataReader
+lxml
+beautifulsoup4
+html5lib
+requests-file
+tqdm
