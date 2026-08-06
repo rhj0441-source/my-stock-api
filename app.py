@@ -75,17 +75,23 @@ def get_korean_name(symbol: str):
     return get_krx_name_map().get(code)
 
 
-def get_kr_stock_via_fdr(code: str):
+_PERIOD_DAYS = {'1mo': 45, '1y': 380, '5y': 1900}
+
+
+def get_kr_stock_via_fdr(code: str, period: str = '1mo'):
     """
     국내 종목(6자리 코드)의 시세를 야후가 아니라 KRX 공식 데이터를 쓰는
     FinanceDataReader로 직접 조회. 야후 쪽 요청 제한(Too Many Requests)의
     영향을 받지 않아 국내 종목 조회가 훨씬 안정적이다.
+
+    period에 따라 필요한 만큼만 가져온다 (1mo는 빠르게, 1y/5y는 그만큼만 더).
     """
     import datetime
     import FinanceDataReader as fdr
 
+    days = _PERIOD_DAYS.get(period, 45)
     end = datetime.date.today()
-    start = end - datetime.timedelta(days=370)  # 52주 고가/저가 계산용
+    start = end - datetime.timedelta(days=days)
     df = fdr.DataReader(code, start.isoformat(), end.isoformat())
 
     if df is None or df.empty:
@@ -99,10 +105,9 @@ def get_kr_stock_via_fdr(code: str):
     change = current_price - previous_close
     change_percent = (change / previous_close) * 100 if previous_close else 0
 
-    recent = df.tail(30)  # 최근 1개월치 차트
     chart_data = [
         {"date": idx.strftime('%Y-%m-%d'), "close": round(float(row['Close']), 2)}
-        for idx, row in recent.iterrows()
+        for idx, row in df.iterrows()
     ]
 
     return {
@@ -111,7 +116,7 @@ def get_kr_stock_via_fdr(code: str):
         'change': change,
         'changePercent': change_percent,
         'currency': 'KRW',
-        'high52': float(df['High'].max()),
+        'high52': float(df['High'].max()),  # 조회한 기간 내 최고/최저 (참고용)
         'low52': float(df['Low'].min()),
         'marketCap': None,  # FDR 개별 종목 조회에는 시가총액이 없음
         'chart': chart_data
@@ -143,15 +148,20 @@ def set_cached_stock(symbol: str, data: dict):
 @app.route('/api/stock')
 def get_stock():
     symbol = request.args.get('symbol', '').strip().upper()
-    
+    period = request.args.get('period', '1mo').strip().lower()
+    if period not in ('1mo', '1y', '5y'):
+        period = '1mo'
+
     if not symbol:
         return jsonify({'error': '종목 코드를 입력해주세요.'}), 400
 
     if symbol.isdigit() and len(symbol) == 6:
         symbol += ".KS"
 
+    cache_key = f"{symbol}:{period}"
+
     # 캐시에 최근(60초 이내) 결과가 있으면 야후에 요청하지 않고 바로 반환
-    cached = get_cached_stock(symbol)
+    cached = get_cached_stock(cache_key)
     if cached:
         return jsonify(cached)
 
@@ -163,9 +173,9 @@ def get_stock():
     # 야후를 거치지 않으므로 'Too Many Requests' 문제 자체를 피한다.
     if is_kr_stock:
         try:
-            price_data = get_kr_stock_via_fdr(code)
+            price_data = get_kr_stock_via_fdr(code, period)
             result = {'symbol': symbol, 'name': korean_name, **price_data}
-            set_cached_stock(symbol, result)
+            set_cached_stock(cache_key, result)
             return jsonify(result)
         except Exception as e:
             print(f"[FDR 조회 실패, 야후로 폴백] {symbol}: {e}")
@@ -185,8 +195,8 @@ def get_stock():
         change = current_price - previous_close if previous_close else 0
         change_percent = (change / previous_close) * 100 if previous_close else 0
 
-        # 최근 1개월 차트 데이터
-        history = ticker.history(period="1mo")
+        # 요청된 기간만큼 차트 데이터 조회
+        history = ticker.history(period=period)
         chart_data = [
             {"date": date.strftime('%Y-%m-%d'), "close": round(row['Close'], 2)}
             for date, row in history.iterrows()
@@ -206,13 +216,13 @@ def get_stock():
             'chart': chart_data
         }
 
-        set_cached_stock(symbol, result)
+        set_cached_stock(cache_key, result)
 
         return jsonify(result)
 
     except Exception as e:
         # 실패 시, 만료된 캐시라도 있으면 완전히 빈손으로 보내지 않고 재사용
-        stale = _stock_cache.get(symbol)
+        stale = _stock_cache.get(cache_key)
         if stale:
             fallback = dict(stale['data'])
             fallback['stale'] = True  # 프론트에서 "약간 오래된 데이터" 표시에 활용 가능
