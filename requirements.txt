@@ -5,7 +5,7 @@ gunicorn
 pandas
 requests
 curl_cffi
-FinanceDataReader
+finance-datareader
 lxml
 beautifulsoup4
 html5lib
