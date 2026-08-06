@@ -1,5 +1,4 @@
 import os
-import re
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import yfinance as yf
@@ -10,42 +9,6 @@ CORS(app)
 
 # 차단 우회를 위한 브라우저 세션 생성 (Chrome 브라우저 위장)
 session = requests_cffi.Session(impersonate="chrome110")
-
-# 종목명은 자주 안 바뀌므로 서버 메모리에 캐시해서 요청 횟수를 줄임
-_name_cache = {}
-
-def get_name_from_naver(code):
-    """국내 종목명은 네이버금융 페이지 <title>에서 한글로 가져옴 (야후파이낸스는 영문 이름만 줌)"""
-    try:
-        resp = session.get(f"https://finance.naver.com/item/main.naver?code={code}", timeout=5)
-        resp.encoding = 'euc-kr'
-        match = re.search(r'<title>\s*(.*?)\s*:\s*네이버', resp.text)
-        if match and match.group(1).strip():
-            return match.group(1).strip()
-    except Exception:
-        pass
-    return None
-
-def get_stock_name(ticker, symbol):
-    if symbol in _name_cache:
-        return _name_cache[symbol]
-
-    name = None
-    domestic_code = symbol[:-3] if symbol.endswith('.KS') or symbol.endswith('.KQ') else None
-
-    if domestic_code:
-        name = get_name_from_naver(domestic_code)  # 국내 종목 → 한글 이름 우선 시도
-
-    if not name:
-        try:
-            info = ticker.info  # longName/shortName은 fast_info엔 없어서 별도 조회 필요
-            name = info.get('longName') or info.get('shortName')
-        except Exception:
-            pass
-
-    name = name or symbol
-    _name_cache[symbol] = name
-    return name
 
 @app.route('/api/stock')
 def get_stock():
@@ -78,11 +41,8 @@ def get_stock():
             for date, row in history.iterrows()
         ]
 
-        name = get_stock_name(ticker, symbol)
-
         return jsonify({
             'symbol': symbol,
-            'name': name,
             'currentPrice': current_price,
             'previousClose': previous_close,
             'change': change,
