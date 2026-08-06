@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import threading
 from flask import Flask, jsonify, request
@@ -179,16 +180,26 @@ def fetch_yahoo_quote(yahoo_symbol: str, period: str) -> dict:
 
 
 # ---------------------------------------------------------
-# 국내 주식/ETF 전용: 종목명은 KRX 캐시에서, 나머지 시세 정보는
-# 전부 야후 파이낸스에서 가져온다.
+# 국내 주식/ETF 전용: 종목명은 KRX 캐시를 우선 사용하되,
+# 캐시에 없으면(최근 상장 등) 야후 파이낸스 이름으로 폴백한다.
+# 가격/차트 등 나머지 시세 정보는 전부 야후 파이낸스에서 가져온다.
 # ---------------------------------------------------------
+_KR_CODE_RE = re.compile(r'^[A-Z0-9]{6}$')
+
+
+def is_kr_code(code: str) -> bool:
+    """국내 종목/ETF 코드 형식: 6자리이고 숫자를 최소 1개 이상 포함
+    (예: '005930', 최근 상장된 단일종목 ETF의 '0195S0' 같은 코드도 허용)."""
+    return bool(_KR_CODE_RE.match(code)) and any(ch.isdigit() for ch in code)
+
+
 @app.route('/api/kr-stock')
 def get_kr_stock():
-    code = request.args.get('code', '').strip()
+    code = request.args.get('code', '').strip().upper()
     period = resolve_period(request.args.get('period'))
 
-    if not (code.isdigit() and len(code) == 6):
-        return jsonify({'error': '국내 종목 코드는 6자리 숫자여야 합니다.'}), 400
+    if not is_kr_code(code):
+        return jsonify({'error': '국내 종목 코드는 6자리 코드여야 합니다.'}), 400
 
     cache_key = f"KR:{code}:{period}"
     cached = get_cached_stock(cache_key)
@@ -199,11 +210,14 @@ def get_kr_stock():
 
     try:
         quote = fetch_yahoo_quote(yahoo_symbol, period)
-        quote.pop('_ticker', None)
+        ticker = quote.pop('_ticker')
+
+        # 1순위: KRX 종목명 캐시. 없으면(신규 상장 등) 야후 이름으로 폴백.
+        name = get_krx_name_map().get(code) or get_foreign_name(yahoo_symbol, ticker)
 
         result = {
             'symbol': code,
-            'name': get_krx_name_map().get(code),  # 종목명만 KRX 캐시에서
+            'name': name,
             **quote,
         }
         set_cached_stock(cache_key, result)
