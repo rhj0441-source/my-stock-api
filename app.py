@@ -40,8 +40,23 @@ def get_krx_name_map():
 
         try:
             import FinanceDataReader as fdr
-            df = fdr.StockListing('KRX')  # 코스피+코스닥 전체 종목 리스트
-            new_map = dict(zip(df['Code'].astype(str).str.zfill(6), df['Name']))
+            new_map = {}
+
+            # 일반 상장 주식 (코스피+코스닥)
+            df_stock = fdr.StockListing('KRX')
+            new_map.update(
+                dict(zip(df_stock['Code'].astype(str).str.zfill(6), df_stock['Name']))
+            )
+
+            # ETF (예: KODEX, TIGER 등) - 일반 주식 리스트에는 안 들어있어서 별도로 합침
+            try:
+                df_etf = fdr.StockListing('ETF/KR')
+                new_map.update(
+                    dict(zip(df_etf['Symbol'].astype(str).str.zfill(6), df_etf['Name']))
+                )
+            except Exception as e_etf:
+                print(f"[ETF 목록 캐시 갱신 실패] {e_etf}")
+
             if new_map:
                 _krx_name_cache = new_map
                 _krx_cache_updated_at = now
