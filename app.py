@@ -1,4 +1,6 @@
 import os
+import time
+import threading
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import yfinance as yf
@@ -9,6 +11,53 @@ CORS(app)
 
 # 차단 우회를 위한 브라우저 세션 생성 (Chrome 브라우저 위장)
 session = requests_cffi.Session(impersonate="chrome110")
+
+# ---------------------------------------------------------
+# KRX(한국거래소) 종목코드 -> 종목명 캐시
+# 네이버 등 개별 페이지를 매번 긁는 대신, KRX 전체 종목 리스트를
+# 하루 한 번 정도만 갱신해서 메모리에 캐싱해두는 방식.
+# 요청마다 외부 스크래핑을 하지 않으므로 차단될 일이 거의 없음.
+# ---------------------------------------------------------
+_krx_name_cache = {}
+_krx_cache_lock = threading.Lock()
+_krx_cache_updated_at = 0
+_KRX_CACHE_TTL = 6 * 60 * 60  # 6시간마다 갱신
+
+
+def get_krx_name_map():
+    """{'005930': '삼성전자', ...} 형태의 딕셔너리를 반환 (캐시됨)"""
+    global _krx_name_cache, _krx_cache_updated_at
+    now = time.time()
+
+    if _krx_name_cache and (now - _krx_cache_updated_at) < _KRX_CACHE_TTL:
+        return _krx_name_cache
+
+    with _krx_cache_lock:
+        # 락 획득 대기 중 다른 스레드가 이미 갱신했을 수 있으니 재확인
+        now = time.time()
+        if _krx_name_cache and (now - _krx_cache_updated_at) < _KRX_CACHE_TTL:
+            return _krx_name_cache
+
+        try:
+            import FinanceDataReader as fdr
+            df = fdr.StockListing('KRX')  # 코스피+코스닥 전체 종목 리스트
+            new_map = dict(zip(df['Code'].astype(str).str.zfill(6), df['Name']))
+            if new_map:
+                _krx_name_cache = new_map
+                _krx_cache_updated_at = now
+        except Exception as e:
+            print(f"[KRX 종목명 캐시 갱신 실패] {e}")
+            # 갱신 실패 시 기존 캐시(있다면) 유지
+
+        return _krx_name_cache
+
+
+def get_korean_name(symbol: str):
+    """'005930' 또는 '005930.KS' 형태의 심볼에서 한글 종목명을 찾아 반환"""
+    code = symbol.split('.')[0]
+    if not (code.isdigit() and len(code) == 6):
+        return None
+    return get_krx_name_map().get(code)
 
 @app.route('/api/stock')
 def get_stock():
@@ -41,8 +90,11 @@ def get_stock():
             for date, row in history.iterrows()
         ]
 
+        korean_name = get_korean_name(symbol)
+
         return jsonify({
             'symbol': symbol,
+            'name': korean_name,  # 한글 종목명 (KRX 캐시에 없으면 null)
             'currentPrice': current_price,
             'previousClose': previous_close,
             'change': change,
@@ -56,6 +108,10 @@ def get_stock():
 
     except Exception as e:
         return jsonify({'error': f'요청 제한 또는 오류 발생: ({str(e)})'}), 404
+
+# 서버 시작 시 백그라운드에서 KRX 종목명 캐시를 미리 예열
+# (첫 요청 때 사용자가 몇 초씩 기다리지 않도록)
+threading.Thread(target=get_krx_name_map, daemon=True).start()
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
