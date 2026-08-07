@@ -310,24 +310,58 @@ def screener_stale_fallback(key: str):
     return None
 
 
-def run_marketcap_screen(region: str, count: int) -> list:
+def run_marketcap_screen(region: str, offset: int, count: int):
+    """(중복 제거된 종목 리스트, 야후가 실제로 내려준 원본 개수)를 반환.
+    dedup으로 개수가 줄어들 수 있으므로, '다음 페이지가 더 있는지' 판단은
+    dedup 이전의 원본 개수를 기준으로 해야 한다."""
     q = EquityQuery('and', [
         EquityQuery('eq', ['region', region]),
         EquityQuery('gt', ['intradaymarketcap', 0]),
     ])
-    result = yf.screen(q, sortField='intradaymarketcap', sortAsc=False, size=count)
+    result = yf.screen(q, sortField='intradaymarketcap', sortAsc=False, offset=offset, size=count)
     quotes = result.get('quotes', []) if result else []
+    raw_count = len(quotes)
 
-    return [{
-        'symbol': item.get('symbol'),
-        'name': item.get('longName') or item.get('shortName'),
-        'exchange': item.get('fullExchangeName') or item.get('exchange'),
-        'currency': item.get('currency'),
-        'price': item.get('regularMarketPrice'),
-        'change': item.get('regularMarketChange'),
-        'changePercent': item.get('regularMarketChangePercent'),
-        'marketCap': item.get('marketCap'),
-    } for item in quotes]
+    items = []
+    for item in quotes:
+        raw_name = item.get('longName') or item.get('shortName') or item.get('symbol') or ''
+        items.append({
+            'symbol': item.get('symbol'),
+            'name': raw_name,
+            # 같은 회사의 보통주/우선주, 복수 클래스 주식(GOOGL/GOOG 등)을 하나로 묶기 위한 키.
+            # 야후는 이런 경우 longName이 보통 동일하게 내려오므로 이를 그대로 그룹핑 기준으로 쓴다.
+            '_group_key': re.sub(r'\s+', ' ', raw_name).strip().lower() or item.get('symbol'),
+            'exchange': item.get('fullExchangeName') or item.get('exchange'),
+            'currency': item.get('currency'),
+            'price': item.get('regularMarketPrice'),
+            'change': item.get('regularMarketChange'),
+            'changePercent': item.get('regularMarketChangePercent'),
+            'marketCap': item.get('marketCap'),
+        })
+
+    # 이미 시가총액 내림차순으로 정렬돼 있으므로, 같은 그룹에서 먼저 나오는(=시가총액이 더 큰)
+    # 종목만 남기고 나머지(우선주, 보조 클래스 등)는 제거한다.
+    seen_groups = set()
+    deduped = []
+    for it in items:
+        key = it['_group_key']
+        if key in seen_groups:
+            continue
+        seen_groups.add(key)
+        deduped.append(it)
+
+    if region == 'kr':
+        krx_names = get_krx_name_map()
+        for it in deduped:
+            bare_code = (it['symbol'] or '').split('.')[0]
+            korean_name = krx_names.get(bare_code)
+            if korean_name:
+                it['name'] = korean_name
+
+    for it in deduped:
+        it.pop('_group_key', None)
+
+    return deduped, raw_count
 
 
 @app.route('/api/top-marketcap')
@@ -342,17 +376,29 @@ def get_top_marketcap():
         count = 100
     count = max(1, min(count, 250))  # 야후 스크리너 1회 최대 250개
 
-    cache_key = f"SCREEN:{region}:{count}"
+    try:
+        offset = int(request.args.get('offset', 0))
+    except ValueError:
+        offset = 0
+    offset = max(0, offset)
+
+    cache_key = f"SCREEN:{region}:{offset}:{count}"
     cached = get_cached_screener(cache_key)
     if cached:
         return jsonify(cached)
 
     try:
-        items = run_marketcap_screen(region, count)
-        if not items:
+        items, raw_count = run_marketcap_screen(region, offset, count)
+        if raw_count == 0:
             return jsonify({'error': f'{region} 시가총액 스크리너 결과가 비어있습니다.'}), 404
 
-        result = {'region': region, 'count': len(items), 'items': items}
+        result = {
+            'region': region,
+            'offset': offset,
+            'count': len(items),
+            'rawCount': raw_count,  # 중복 제거 전 원본 개수. 다음 페이지 존재 여부 판단용(rawCount == count면 더 있을 가능성 높음)
+            'items': items,
+        }
         set_cached_screener(cache_key, result)
         return jsonify(result)
     except Exception as e:
