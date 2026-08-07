@@ -356,7 +356,9 @@ def run_marketcap_screen(region: str, offset: int, count: int):
     if region == 'kr':
         krx_names = get_krx_name_map()
         for it in deduped:
-            bare_code = (it['symbol'] or '').split('.')[0]
+            # 야후가 앞자리 0을 뺀 코드(예: '5930')를 내려주는 경우가 있어
+            # KRX 캐시 키(6자리 zero-pad)와 어긋나 한글명을 못 찾는 문제를 방지.
+            bare_code = (it['symbol'] or '').split('.')[0].zfill(6)
             korean_name = krx_names.get(bare_code)
             if korean_name:
                 it['name'] = korean_name
