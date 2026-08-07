@@ -37,12 +37,15 @@ def get_krx_name_map():
     if _krx_name_cache and (now - _krx_cache_updated_at) < _KRX_CACHE_TTL:
         return _krx_name_cache
 
-    # 서버 기동 직후 백그라운드 워밍업 스레드가 전체 종목 목록을 다운로드하는 동안
+    # 서버 기동 직후(콜드 스타트) 백그라운드 워밍업 스레드가 전체 종목 목록을 다운로드하는 동안
     # 락을 잡고 있을 수 있다. 이때 요청 스레드가 락 대기로 멈춰버리면
     # gunicorn/Render의 요청 타임아웃(약 30초)을 넘겨 연결이 끊길 수 있으므로,
-    # 락 획득을 짧게(최대 3초)만 시도하고 실패하면 빈 캐시로 즉시 넘어간다.
-    # (이름은 이후 get_foreign_name()으로 폴백되므로 시세 조회 자체는 막히지 않는다.)
-    acquired = _krx_cache_lock.acquire(timeout=3)
+    # 락 획득을 최대 8초까지만 시도하고 실패하면 빈 캐시로 즉시 넘어간다.
+    # (3초는 콜드 스타트 직후 워밍업이 아직 안 끝난 경우가 많아 한국 종목명이
+    # 영문/로마자로 표시되는 경우가 잦았음 -> 8초로 늘려 대부분의 경우 워밍업이
+    # 끝날 시간을 확보. 그래도 실패하면 이름은 이후 get_foreign_name()으로
+    # 폴백되므로 시세 조회 자체는 막히지 않는다.)
+    acquired = _krx_cache_lock.acquire(timeout=8)
     if not acquired:
         return _krx_name_cache  # 워밍업 진행 중이면 빈 캐시(또는 이전 캐시) 그대로 반환
 
