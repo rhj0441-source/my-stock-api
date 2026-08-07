@@ -6,6 +6,7 @@ pandas
 requests
 curl_cffi
 finance-datareader
+pykrx
 lxml
 beautifulsoup4
 html5lib
