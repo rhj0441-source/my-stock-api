@@ -2,6 +2,7 @@ import os
 import re
 import time
 import threading
+import concurrent.futures
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import yfinance as yf
@@ -77,8 +78,12 @@ def get_krx_name_map():
                 print(f"[ETF 목록 캐시 갱신 실패] {e_etf}")
 
             if new_map:
-                _krx_name_cache = new_map
-                _krx_market_cache = new_market_map
+                # 덮어쓰기(=) 대신 병합(update)한다. resolve_missing_kr_name()으로
+                # 개별 보강해둔 종목명이 있다면, 벌크 소스가 6시간마다(또는 서버 재시작마다)
+                # 갱신될 때 그 값을 지워버리면 매번 느린 개별 재조회가 반복되기 때문.
+                # 벌크 소스 값이 더 최신이므로 동일 코드가 있으면 벌크 값으로 덮인다.
+                _krx_name_cache.update(new_map)
+                _krx_market_cache.update(new_market_map)
                 _krx_cache_updated_at = now
         except Exception as e:
             print(f"[KRX 종목명 캐시 갱신 실패] {e}")
@@ -404,20 +409,38 @@ def run_marketcap_screen(region: str, offset: int, count: int):
 
     if region == 'kr':
         krx_names = get_krx_name_map()
-        unresolved = []
+        to_resolve = []  # (item, bare_code) — 벌크 캐시에 없어 개별 보강이 필요한 항목
         for it in deduped:
             # 야후가 앞자리 0을 뺀 코드(예: '5930')를 내려주는 경우가 있어
             # KRX 캐시 키(6자리 zero-pad)와 어긋나 한글명을 못 찾는 문제를 방지.
             bare_code = (it['symbol'] or '').split('.')[0].zfill(6)
             korean_name = krx_names.get(bare_code)
-            if not korean_name:
-                # 벌크 목록(FDR/KIND)에 없는 코드(스핀오프/홀딩스 등 특수 코드 포함)는
-                # 개별 보강 조회로 재시도. 그래도 없으면 기존 야후 영문명을 유지.
-                korean_name = resolve_missing_kr_name(bare_code)
-                if not korean_name:
-                    unresolved.append(bare_code)
             if korean_name:
                 it['name'] = korean_name
+            else:
+                to_resolve.append((it, bare_code))
+
+        # 벌크 소스(FDR/KIND)가 상당수 종목을 놓치는 경우, 개별 보강 조회(pykrx)를
+        # 순차 실행하면 종목 수만큼 네트워크 왕복이 누적돼 응답이 매우 느려진다.
+        # 이를 스레드풀로 병렬 실행해 전체 대기시간을 크게 줄인다.
+        unresolved = []
+        if to_resolve:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(20, len(to_resolve))) as executor:
+                future_to_item = {
+                    executor.submit(resolve_missing_kr_name, bare_code): (it, bare_code)
+                    for it, bare_code in to_resolve
+                }
+                for future in concurrent.futures.as_completed(future_to_item):
+                    it, bare_code = future_to_item[future]
+                    try:
+                        korean_name = future.result()
+                    except Exception as e:
+                        print(f"[개별 종목명 보강 실패] {bare_code}: {e}")
+                        korean_name = None
+                    if korean_name:
+                        it['name'] = korean_name
+                    else:
+                        unresolved.append(bare_code)
         if unresolved:
             print(f"[KR 스크리너] 한글명 미해결 코드 {len(unresolved)}개: {unresolved}")
 
