@@ -5,6 +5,7 @@ import threading
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import yfinance as yf
+from yfinance import EquityQuery
 from curl_cffi import requests as requests_cffi
 
 app = Flask(__name__)
@@ -275,6 +276,90 @@ def get_global_stock():
         if fallback:
             return jsonify(fallback)
         return jsonify({'error': f'해외 시세 조회 실패: ({str(e)})'}), 404
+
+
+# ---------------------------------------------------------
+# 시가총액 상위 스크리너 (미국/한국) - 야후 EquityQuery 사용
+# 하드코딩된 종목 리스트 없이 야후가 계산한 시가총액 기준으로
+# 실시간 상위 종목을 직접 조회한다.
+# ---------------------------------------------------------
+_SCREENER_CACHE_TTL = 300  # 5분 (요청마다 새로 스크리닝하면 느리고 차단 위험도 있음)
+_screener_cache = {}
+_screener_cache_lock = threading.Lock()
+
+
+def get_cached_screener(key: str):
+    entry = _screener_cache.get(key)
+    if entry and (time.time() - entry['ts']) < _SCREENER_CACHE_TTL:
+        return entry['data']
+    return None
+
+
+def set_cached_screener(key: str, data: dict):
+    with _screener_cache_lock:
+        _screener_cache[key] = {'data': data, 'ts': time.time()}
+
+
+def screener_stale_fallback(key: str):
+    """스크리너 실패 시 만료된 캐시라도 있으면 재사용 (stale 표시 추가)"""
+    stale = _screener_cache.get(key)
+    if stale:
+        fb = dict(stale['data'])
+        fb['stale'] = True
+        return fb
+    return None
+
+
+def run_marketcap_screen(region: str, count: int) -> list:
+    q = EquityQuery('and', [
+        EquityQuery('eq', ['region', region]),
+        EquityQuery('gt', ['intradaymarketcap', 0]),
+    ])
+    result = yf.screen(q, sortField='intradaymarketcap', sortAsc=False, size=count)
+    quotes = result.get('quotes', []) if result else []
+
+    return [{
+        'symbol': item.get('symbol'),
+        'name': item.get('longName') or item.get('shortName'),
+        'exchange': item.get('fullExchangeName') or item.get('exchange'),
+        'currency': item.get('currency'),
+        'price': item.get('regularMarketPrice'),
+        'change': item.get('regularMarketChange'),
+        'changePercent': item.get('regularMarketChangePercent'),
+        'marketCap': item.get('marketCap'),
+    } for item in quotes]
+
+
+@app.route('/api/top-marketcap')
+def get_top_marketcap():
+    region = request.args.get('region', 'us').strip().lower()
+    if region not in ('us', 'kr'):
+        return jsonify({'error': "region은 'us' 또는 'kr'만 지원합니다."}), 400
+
+    try:
+        count = int(request.args.get('count', 100))
+    except ValueError:
+        count = 100
+    count = max(1, min(count, 250))  # 야후 스크리너 1회 최대 250개
+
+    cache_key = f"SCREEN:{region}:{count}"
+    cached = get_cached_screener(cache_key)
+    if cached:
+        return jsonify(cached)
+
+    try:
+        items = run_marketcap_screen(region, count)
+        if not items:
+            return jsonify({'error': f'{region} 시가총액 스크리너 결과가 비어있습니다.'}), 404
+
+        result = {'region': region, 'count': len(items), 'items': items}
+        set_cached_screener(cache_key, result)
+        return jsonify(result)
+    except Exception as e:
+        fallback = screener_stale_fallback(cache_key)
+        if fallback:
+            return jsonify(fallback)
+        return jsonify({'error': f'시가총액 순위 조회 실패: ({str(e)})'}), 502
 
 
 # 서버 시작 시 백그라운드에서 KRX 종목명 캐시를 미리 예열
