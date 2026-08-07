@@ -40,12 +40,14 @@ def get_krx_name_map():
     # 서버 기동 직후(콜드 스타트) 백그라운드 워밍업 스레드가 전체 종목 목록을 다운로드하는 동안
     # 락을 잡고 있을 수 있다. 이때 요청 스레드가 락 대기로 멈춰버리면
     # gunicorn/Render의 요청 타임아웃(약 30초)을 넘겨 연결이 끊길 수 있으므로,
-    # 락 획득을 최대 8초까지만 시도하고 실패하면 빈 캐시로 즉시 넘어간다.
-    # (3초는 콜드 스타트 직후 워밍업이 아직 안 끝난 경우가 많아 한국 종목명이
-    # 영문/로마자로 표시되는 경우가 잦았음 -> 8초로 늘려 대부분의 경우 워밍업이
-    # 끝날 시간을 확보. 그래도 실패하면 이름은 이후 get_foreign_name()으로
-    # 폴백되므로 시세 조회 자체는 막히지 않는다.)
-    acquired = _krx_cache_lock.acquire(timeout=8)
+    # 락 획득 대기시간을 상황별로 다르게 둔다.
+    # - 최초 예열(이전에 한 번도 캐시가 채워진 적 없음): 여기서 빈 캐시로 넘어가면
+    #   실패한 이름이 스크리너의 5분 캐시에 그대로 박제되는 문제가 있었으므로,
+    #   gunicorn 타임아웃(~30초) 안에서 최대한 예열이 끝나길 기다린다(25초).
+    # - 이후 정기 갱신(6시간마다, 이미 이전 캐시가 있는 상태): 사용자를 오래 기다리게
+    #   할 필요 없이 8초만 기다리고 실패하면 기존(이전) 캐시를 그대로 반환한다.
+    is_cold_start = not _krx_name_cache
+    acquired = _krx_cache_lock.acquire(timeout=25 if is_cold_start else 8)
     if not acquired:
         return _krx_name_cache  # 워밍업 진행 중이면 빈 캐시(또는 이전 캐시) 그대로 반환
 
@@ -109,6 +111,27 @@ def get_krx_name_map():
         return _krx_name_cache
     finally:
         _krx_cache_lock.release()
+
+
+def resolve_missing_kr_name(code: str):
+    """FDR/KIND 벌크 목록에 없는 코드(스핀오프/홀딩스 등 특수 코드, 최근 상장,
+    데이터 소스 누락 등)를 개별적으로 보강 조회한다.
+    pykrx는 KRX를 직접 소스로 쓰므로 FDR/KIND와 커버리지가 달라
+    벌크 목록에서 빠진 종목도 잡히는 경우가 많다.
+    성공하면 전역 캐시에 영구 반영해 다음부터는 벌크 캐시처럼 즉시 반환된다."""
+    global _krx_name_cache
+    if code in _krx_name_cache:
+        return _krx_name_cache[code]
+    try:
+        from pykrx import stock as pykrx_stock
+        name = pykrx_stock.get_market_ticker_name(code)
+        if name:
+            with _krx_cache_lock:
+                _krx_name_cache[code] = name
+            return name
+    except Exception as e:
+        print(f"[개별 종목명 보강 실패] {code}: {e}")
+    return None
 
 
 def get_yahoo_suffix(code: str) -> str:
@@ -252,8 +275,9 @@ def get_kr_stock():
         quote = fetch_yahoo_quote(yahoo_symbol, period)
         ticker = quote.pop('_ticker')
 
-        # 1순위: KRX 종목명 캐시. 없으면(신규 상장 등) 야후 이름으로 폴백.
-        name = get_krx_name_map().get(code) or get_foreign_name(yahoo_symbol, ticker)
+        # 1순위: KRX 종목명 벌크 캐시. 2순위: 개별 보강 조회(pykrx).
+        # 그래도 없으면(신규 상장 등) 야후 이름으로 최종 폴백.
+        name = get_krx_name_map().get(code) or resolve_missing_kr_name(code) or get_foreign_name(yahoo_symbol, ticker)
 
         result = {
             'symbol': code,
@@ -380,13 +404,22 @@ def run_marketcap_screen(region: str, offset: int, count: int):
 
     if region == 'kr':
         krx_names = get_krx_name_map()
+        unresolved = []
         for it in deduped:
             # 야후가 앞자리 0을 뺀 코드(예: '5930')를 내려주는 경우가 있어
             # KRX 캐시 키(6자리 zero-pad)와 어긋나 한글명을 못 찾는 문제를 방지.
             bare_code = (it['symbol'] or '').split('.')[0].zfill(6)
             korean_name = krx_names.get(bare_code)
+            if not korean_name:
+                # 벌크 목록(FDR/KIND)에 없는 코드(스핀오프/홀딩스 등 특수 코드 포함)는
+                # 개별 보강 조회로 재시도. 그래도 없으면 기존 야후 영문명을 유지.
+                korean_name = resolve_missing_kr_name(bare_code)
+                if not korean_name:
+                    unresolved.append(bare_code)
             if korean_name:
                 it['name'] = korean_name
+        if unresolved:
+            print(f"[KR 스크리너] 한글명 미해결 코드 {len(unresolved)}개: {unresolved}")
 
     for it in deduped:
         it.pop('_group_key', None)
