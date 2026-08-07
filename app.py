@@ -81,6 +81,31 @@ def get_krx_name_map():
         except Exception as e:
             print(f"[KRX 종목명 캐시 갱신 실패] {e}")
 
+        # FDR의 KRX 조회는 한국거래소 사이트 구조가 바뀔 때마다 종종 깨지는(404/401 등)
+        # 고질적인 문제가 있다. FDR이 실패했거나 빈 결과를 줬다면, 한국거래소의
+        # 다른 다운로드 창구(KIND 상장법인목록)를 대체 소스로 사용해본다.
+        # 이 창구는 marketType별로 따로 요청할 수 있어 코스피/코스닥 구분도 같이 얻을 수 있다.
+        if not _krx_name_cache:
+            try:
+                import pandas as pd
+                kind_url = 'http://kind.krx.co.kr/corpgeneral/corpList.do?method=download&searchType=13'
+                kind_name_map = {}
+                kind_market_map = {}
+                for market_type, market_label in (('stockMkt', 'KOSPI'), ('kosdaqMkt', 'KOSDAQ')):
+                    df = pd.read_html(f'{kind_url}&marketType={market_type}', header=0)[0]
+                    codes_k = df['종목코드'].astype(str).str.zfill(6)
+                    kind_name_map.update(dict(zip(codes_k, df['회사명'])))
+                    if market_label == 'KOSDAQ':
+                        kind_market_map.update({c: 'KOSDAQ' for c in codes_k})
+
+                if kind_name_map:
+                    _krx_name_cache = kind_name_map
+                    _krx_market_cache = kind_market_map
+                    _krx_cache_updated_at = now
+                    print(f"[KRX 종목명 캐시] FDR 실패 -> KIND 대체 소스로 {len(kind_name_map)}개 종목명 확보")
+            except Exception as e2:
+                print(f"[KRX 종목명 캐시 갱신 실패 - KIND 대체소스도 실패] {e2}")
+
         return _krx_name_cache
     finally:
         _krx_cache_lock.release()
