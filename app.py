@@ -197,6 +197,31 @@ def set_cached_stock(key: str, data: dict):
         _stock_cache[key] = {'data': data, 'ts': time.time()}
 
 
+# ---------------------------------------------------------
+# 종목 검색 결과 캐시 (짧은 TTL - 검색어는 계속 바뀌므로 오래 들고 있을 필요 없음)
+# ---------------------------------------------------------
+_search_cache = {}
+_search_cache_lock = threading.Lock()
+_SEARCH_CACHE_TTL = 120
+
+
+def get_cached_search(key: str):
+    entry = _search_cache.get(key)
+    if entry and (time.time() - entry['ts']) < _SEARCH_CACHE_TTL:
+        return entry['data']
+    return None
+
+
+def set_cached_search(key: str, data: dict):
+    with _search_cache_lock:
+        _search_cache[key] = {'data': data, 'ts': time.time()}
+
+
+def is_otc_exchange(exch_raw: str) -> bool:
+    """OTC(장외/핑크시트) 거래소 여부. 미국 검색에서 비정규 상장 ADR 등을 걸러내기 위함."""
+    return any(code in exch_raw for code in ('PNK', 'OTC', 'PINK', 'GREY', 'EXPM', 'OEM', 'OTCQB', 'OTCQX'))
+
+
 def stale_fallback(key: str):
     """실패 시 만료된 캐시라도 있으면 재사용 (stale 표시 추가)"""
     stale = _stock_cache.get(key)
@@ -367,14 +392,17 @@ def screener_stale_fallback(key: str):
     return None
 
 
-def run_marketcap_screen(region: str, offset: int, count: int):
+def run_marketcap_screen(region: str, offset: int, count: int, asset_type: str = 'stock'):
     """(중복 제거된 종목 리스트, 야후가 실제로 내려준 원본 개수)를 반환.
     dedup으로 개수가 줄어들 수 있으므로, '다음 페이지가 더 있는지' 판단은
     dedup 이전의 원본 개수를 기준으로 해야 한다."""
-    q = EquityQuery('and', [
+    conditions = [
         EquityQuery('eq', ['region', region]),
         EquityQuery('gt', ['intradaymarketcap', 0]),
-    ])
+    ]
+    if asset_type == 'etf':
+        conditions.append(EquityQuery('eq', ['quoteType', 'ETF']))
+    q = EquityQuery('and', conditions)
     result = yf.screen(q, sortField='intradaymarketcap', sortAsc=False, offset=offset, size=count)
     quotes = result.get('quotes', []) if result else []
     raw_count = len(quotes)
@@ -450,11 +478,76 @@ def run_marketcap_screen(region: str, offset: int, count: int):
     return deduped, raw_count
 
 
+@app.route('/api/search')
+def search_stocks():
+    """종목명/티커로 전체 종목(순위 제한 없음)을 검색.
+    야후 파이낸스의 검색(자동완성) API를 그대로 사용하므로 상위 N개 같은 제한이 없다."""
+    query = request.args.get('q', '').strip()
+    region = request.args.get('region', '').strip().lower()  # '', 'us', 'kr'
+
+    if not query:
+        return jsonify({'query': query, 'items': []})
+
+    cache_key = f"SEARCH:{region}:{query.lower()}"
+    cached = get_cached_search(cache_key)
+    if cached:
+        return jsonify(cached)
+
+    try:
+        resp = session.get(
+            'https://query1.finance.yahoo.com/v1/finance/search',
+            params={'q': query, 'quotesCount': 30, 'newsCount': 0, 'listsCount': 0},
+            timeout=10,
+        )
+        data = resp.json()
+        quotes = data.get('quotes', []) if isinstance(data, dict) else []
+
+        krx_names = get_krx_name_map() if region != 'us' else {}
+
+        items = []
+        for it in quotes:
+            quote_type = (it.get('quoteType') or '').upper()
+            if quote_type not in ('EQUITY', 'ETF'):
+                continue
+            symbol = it.get('symbol')
+            if not symbol:
+                continue
+            exch = (it.get('exchange') or '').upper()
+            is_kr = exch in ('KSC', 'KOE', 'KOSDAQ', 'KOSPI')
+
+            if region == 'us' and (is_kr or is_otc_exchange(exch)):
+                continue
+            if region == 'kr' and not is_kr:
+                continue
+
+            name = it.get('longname') or it.get('shortname') or symbol
+            if is_kr:
+                bare_code = symbol.split('.')[0].zfill(6)
+                name = krx_names.get(bare_code) or name
+
+            items.append({
+                'symbol': symbol,
+                'name': name,
+                'exchange': it.get('exchange'),
+                'quoteType': quote_type,
+            })
+
+        result = {'query': query, 'items': items}
+        set_cached_search(cache_key, result)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': f'검색 실패: ({str(e)})'}), 502
+
+
 @app.route('/api/top-marketcap')
 def get_top_marketcap():
     region = request.args.get('region', 'us').strip().lower()
     if region not in ('us', 'kr'):
         return jsonify({'error': "region은 'us' 또는 'kr'만 지원합니다."}), 400
+
+    asset_type = request.args.get('type', 'stock').strip().lower()
+    if asset_type not in ('stock', 'etf'):
+        return jsonify({'error': "type은 'stock' 또는 'etf'만 지원합니다."}), 400
 
     try:
         count = int(request.args.get('count', 100))
@@ -468,18 +561,20 @@ def get_top_marketcap():
         offset = 0
     offset = max(0, offset)
 
-    cache_key = f"SCREEN:{region}:{offset}:{count}"
+    cache_key = f"SCREEN:{asset_type}:{region}:{offset}:{count}"
     cached = get_cached_screener(cache_key)
     if cached:
         return jsonify(cached)
 
     try:
-        items, raw_count = run_marketcap_screen(region, offset, count)
+        items, raw_count = run_marketcap_screen(region, offset, count, asset_type)
         if raw_count == 0:
-            return jsonify({'error': f'{region} 시가총액 스크리너 결과가 비어있습니다.'}), 404
+            label = 'ETF' if asset_type == 'etf' else '주식'
+            return jsonify({'error': f'{region} {label} 시가총액 스크리너 결과가 비어있습니다.'}), 404
 
         result = {
             'region': region,
+            'type': asset_type,
             'offset': offset,
             'count': len(items),
             'rawCount': raw_count,  # 중복 제거 전 원본 개수. 다음 페이지 존재 여부 판단용(rawCount == count면 더 있을 가능성 높음)
