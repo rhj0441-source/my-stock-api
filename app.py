@@ -15,7 +15,16 @@ CORS(app)
 # 차단 우회를 위한 브라우저 세션 생성 (Chrome 브라우저 위장, 해외 종목 조회에 사용)
 session = requests_cffi.Session(impersonate="chrome110")
 
-_PERIOD_DAYS = {'1mo': 45, '1y': 380, '5y': 1900}
+# 프론트엔드 기간 버튼 키 -> yfinance가 실제로 받는 period 문자열 매핑.
+# ('1w'는 yfinance에 없는 값이라 가장 가까운 '5d'로 매핑)
+_PERIOD_MAP = {
+    '1w': '5d',
+    '1mo': '1mo',
+    '1y': '1y',
+    '5y': '5y',
+    '10y': '10y',
+    'max': 'max',
+}
 
 
 # ---------------------------------------------------------
@@ -208,13 +217,17 @@ def stale_fallback(key: str):
 
 
 def resolve_period(raw: str) -> str:
+    """프론트엔드에서 넘어온 기간 키(1w/1mo/1y/5y/10y/max)를 검증해서 그대로 반환.
+    실제 yfinance period 문자열 변환은 fetch_yahoo_quote 내부에서 처리한다."""
     p = (raw or '1mo').strip().lower()
-    return p if p in _PERIOD_DAYS else '1mo'
+    return p if p in _PERIOD_MAP else '1mo'
 
 
 def fetch_yahoo_quote(yahoo_symbol: str, period: str) -> dict:
     """야후 파이낸스에서 가격/차트/52주 고저/시가총액 등을 조회.
-    name은 포함하지 않음 (호출부에서 소스에 맞게 채움)."""
+    name은 포함하지 않음 (호출부에서 소스에 맞게 채움).
+    period는 프론트엔드 기간 키(1w/1mo/1y/5y/10y/max)이며, 여기서 yfinance
+    period 문자열로 변환해서 사용한다."""
     ticker = yf.Ticker(yahoo_symbol, session=session)
     fast_info = ticker.fast_info
 
@@ -227,7 +240,8 @@ def fetch_yahoo_quote(yahoo_symbol: str, period: str) -> dict:
     change = current_price - previous_close if previous_close else 0
     change_percent = (change / previous_close) * 100 if previous_close else 0
 
-    history = ticker.history(period=period)
+    yf_period = _PERIOD_MAP.get(period, '1mo')
+    history = ticker.history(period=yf_period)
     chart_data = [
         {"date": date.strftime('%Y-%m-%d'), "close": round(row['Close'], 2)}
         for date, row in history.iterrows()
