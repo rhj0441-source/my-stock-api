@@ -1004,8 +1004,155 @@ def get_top_marketcap():
         return jsonify({'error': f'시가총액 순위 조회 실패: ({str(e)})'}), 502
 
 
-# 서버 시작 시 백그라운드에서 KRX 종목명 캐시를 미리 예열
-threading.Thread(target=get_krx_name_map, daemon=True).start()
+# ---------------------------------------------------------
+# "빠른 시세" 전용 엔드포인트 - crumb 인증이 전혀 필요 없는 chart API +
+# 검색(search) API만 사용한다. PER/PBR/ROE/재무제표/해외종목 정식명(ticker.info)처럼
+# 클라우드 IP에서 막히거나 느린 정보는 아예 시도하지 않는다.
+# ---------------------------------------------------------
+
+def get_yahoo_name_fast(query: str, count: int = 1):
+    """야후 검색(자동완성) API로 종목명을 조회. crumb 인증이 필요 없어 빠르고 안정적.
+    quotesCount개의 후보를 리스트로 반환."""
+    try:
+        resp = _yahoo_call_with_retry(
+            session.get,
+            'https://query1.finance.yahoo.com/v1/finance/search',
+            params={'q': query, 'quotesCount': count, 'newsCount': 0},
+            timeout=5,
+            retries=1,
+        )
+        data = resp.json()
+        quotes = data.get('quotes') or []
+        results = []
+        for q in quotes:
+            symbol = q.get('symbol')
+            if not symbol:
+                continue
+            results.append({
+                'symbol': symbol,
+                'name': q.get('longname') or q.get('shortname') or symbol,
+                'exchange': q.get('exchange'),
+                'type': q.get('quoteType'),
+            })
+        return results
+    except Exception as e:
+        print(f"[야후 검색 API 실패] {query}: {e}")
+        return []
+
+
+def fetch_yahoo_quick_quote(yahoo_symbol: str, period: str) -> dict:
+    """fast_info + history만 사용 (인증 불필요, 빠름). PER/PBR/재무제표는 아예 조회하지 않는다."""
+    ticker = yf.Ticker(yahoo_symbol, session=session)
+
+    fi = _yahoo_call_with_retry(lambda: ticker.fast_info)
+    current_price = fi.last_price
+    previous_close = fi.previous_close
+    if current_price is None:
+        raise ValueError("데이터 없음")
+
+    change = current_price - previous_close if previous_close else 0
+    change_percent = (change / previous_close) * 100 if previous_close else 0
+
+    history = _yahoo_call_with_retry(ticker.history, period=_PERIOD_MAP.get(period, '1mo'))
+    chart_data = [
+        {"date": date.strftime('%Y-%m-%d'), "close": round(row['Close'], 2), "volume": int(row['Volume'])}
+        for date, row in history.iterrows()
+    ]
+
+    def _safe(attr):
+        try:
+            v = getattr(fi, attr)
+            return None if _is_nan(v) else v
+        except Exception:
+            return None
+
+    return {
+        'currentPrice': current_price,
+        'previousClose': previous_close,
+        'change': change,
+        'changePercent': change_percent,
+        'open': _safe('open'),
+        'dayHigh': _safe('day_high'),
+        'dayLow': _safe('day_low'),
+        'high52': _safe('year_high'),
+        'low52': _safe('year_low'),
+        'yearChangePercent': _pct(_safe('year_change')),
+        'marketCap': _safe('market_cap'),
+        'shares': _safe('shares'),
+        'currency': _safe('currency') or 'USD',
+        'exchange': _safe('exchange'),
+        'timezone': _safe('timezone'),
+        'quoteType': _safe('quote_type'),
+        'volume': _safe('last_volume'),
+        'avgVolume10d': _safe('ten_day_average_volume'),
+        'avgVolume3m': _safe('three_month_average_volume'),
+        'fiftyDayAvg': _safe('fifty_day_average'),
+        'twoHundredDayAvg': _safe('two_hundred_day_average'),
+        'chart': chart_data,
+    }
+
+
+@app.route('/api/quick-quote')
+def get_quick_quote():
+    raw = request.args.get('symbol', '').strip()
+    period = resolve_period(request.args.get('period'))
+    if not raw:
+        return jsonify({'error': '종목 코드를 입력해주세요.'}), 400
+
+    code = raw.upper()
+    cache_key = f"QUICK:{code}:{period}"
+    cached = get_cached_stock(cache_key)
+    if cached:
+        return jsonify(cached)
+
+    try:
+        if is_kr_code(code):
+            yahoo_symbol = code + get_yahoo_suffix(code)
+            # 국내 종목명은 로컬 KRX 캐시(네트워크 호출 없음)를 우선 사용 - 가장 빠름.
+            name = get_krx_name_map().get(code) or resolve_missing_kr_name(code)
+            if not name:
+                found = get_yahoo_name_fast(code)
+                name = found[0]['name'] if found else code
+        else:
+            yahoo_symbol = code
+            found = get_yahoo_name_fast(code)
+            name = found[0]['name'] if found else code
+
+        quote = fetch_yahoo_quick_quote(yahoo_symbol, period)
+        result = {'symbol': code, 'name': name, **quote}
+        set_cached_stock(cache_key, result)
+        return jsonify(result)
+    except Exception as e:
+        fallback = stale_fallback(cache_key)
+        if fallback:
+            return jsonify(fallback)
+        return jsonify({'error': f'시세 조회 실패: ({str(e)})'}), 404
+
+
+@app.route('/api/search')
+def search_symbol():
+    """검색창 자동완성용 - 야후 검색 API를 그대로 얇게 감싼다 (crumb 불필요, 빠름)."""
+    q = request.args.get('q', '').strip()
+    if not q:
+        return jsonify({'results': []})
+
+    if is_kr_code(q.upper()) or not q[:1].isascii():
+        # 국내 종목/한글 검색은 로컬 KRX 이름 캐시에서 우선 매칭 (네트워크 호출 없이 즉시)
+        krx_names = get_krx_name_map()
+        needle = q.strip().lower()
+        local_hits = [
+            {'symbol': code, 'name': name, 'exchange': 'KRX', 'type': 'EQUITY'}
+            for code, name in krx_names.items()
+            if needle in code.lower() or needle in str(name).lower()
+        ][:8]
+        if local_hits:
+            return jsonify({'results': local_hits})
+
+    results = get_yahoo_name_fast(q, count=8)
+    return jsonify({'results': results})
+
+
+
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
