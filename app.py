@@ -15,7 +15,7 @@ CORS(app)
 # 차단 우회를 위한 브라우저 세션 생성 (Chrome 브라우저 위장, 해외 종목 조회에 사용)
 session = requests_cffi.Session(impersonate="chrome110")
 
-# 프론트엔드 기간 버튼 키 -> yfinance가 실제로 받는 period 문자열 매핑.
+# 프론트엔드 기간 버튼 값 -> yfinance가 실제로 받는 period 문자열 매핑
 # ('1w'는 yfinance에 없는 값이라 가장 가까운 '5d'로 매핑)
 _PERIOD_MAP = {
     '1w': '5d',
@@ -217,17 +217,92 @@ def stale_fallback(key: str):
 
 
 def resolve_period(raw: str) -> str:
-    """프론트엔드에서 넘어온 기간 키(1w/1mo/1y/5y/10y/max)를 검증해서 그대로 반환.
-    실제 yfinance period 문자열 변환은 fetch_yahoo_quote 내부에서 처리한다."""
     p = (raw or '1mo').strip().lower()
     return p if p in _PERIOD_MAP else '1mo'
 
 
+def _is_nan(v):
+    return v is None or v != v  # NaN은 자기 자신과 같지 않다는 성질을 이용 (pandas 미의존)
+
+
+def _pct(v):
+    """0.245 같은 소수 비율을 24.5(%) 형태로 변환."""
+    if _is_nan(v):
+        return None
+    return round(float(v) * 100, 2)
+
+
+def fetch_fundamentals(ticker: "yf.Ticker") -> dict:
+    """PER/PBR/ROE/부채비율/배당수익률 등 재무 지표 조회 (ticker.info 사용).
+    종목에 따라 일부 지표가 아예 없을 수 있어(ETF 등) 개별적으로 None 처리."""
+    try:
+        info = ticker.info or {}
+    except Exception as e:
+        print(f"[재무지표 조회 실패] {ticker.ticker}: {e}")
+        return {'per': None, 'pbr': None, 'roe': None, 'debtRatio': None, 'dividendYield': None}
+
+    per = info.get('trailingPE')
+    if _is_nan(per):
+        per = info.get('forwardPE')
+
+    pbr = info.get('priceToBook')
+
+    # dividendYield는 yfinance 버전에 따라 0.012(소수) 또는 1.2(이미 %) 두 형태로 내려온 이력이 있어
+    # 값이 1.5보다 크면 이미 %로 간주하고 그대로 쓰고, 아니면 소수로 보고 100을 곱한다.
+    raw_div_yield = info.get('dividendYield')
+    if _is_nan(raw_div_yield):
+        dividend_yield = None
+    elif float(raw_div_yield) > 1.5:
+        dividend_yield = round(float(raw_div_yield), 2)
+    else:
+        dividend_yield = _pct(raw_div_yield)
+
+    return {
+        'per': None if _is_nan(per) else round(float(per), 2),
+        'pbr': None if _is_nan(pbr) else round(float(pbr), 2),
+        'roe': _pct(info.get('returnOnEquity')),
+        # debtToEquity는 Yahoo에서 이미 %로 내려옴 (예: 45.3 = 45.3%)
+        'debtRatio': None if _is_nan(info.get('debtToEquity')) else round(float(info.get('debtToEquity')), 1),
+        'dividendYield': dividend_yield,
+    }
+
+
+def fetch_annual_financials(ticker: "yf.Ticker") -> list:
+    """최근 4개년 매출액/영업이익 조회 (연간 손익계산서 기준).
+    ETF 등 손익계산서가 없는 종목은 빈 리스트를 반환한다."""
+    try:
+        fin = ticker.financials
+        if fin is None or fin.empty:
+            return []
+
+        revenue_row = fin.loc['Total Revenue'] if 'Total Revenue' in fin.index else None
+        op_income_row = fin.loc['Operating Income'] if 'Operating Income' in fin.index else None
+        if revenue_row is None and op_income_row is None:
+            return []
+
+        # 컬럼(연도)은 최신순으로 내려오므로 4개만 취하고, 차트 표시를 위해 오래된 순으로 뒤집는다.
+        cols = list(fin.columns)[:4]
+        cols = list(reversed(cols))
+
+        result = []
+        for col in cols:
+            year_label = col.strftime('%Y') if hasattr(col, 'strftime') else str(col)
+            rev = revenue_row[col] if revenue_row is not None and col in revenue_row.index else None
+            op = op_income_row[col] if op_income_row is not None and col in op_income_row.index else None
+            result.append({
+                'year': year_label,
+                'revenue': None if _is_nan(rev) else float(rev),
+                'operatingIncome': None if _is_nan(op) else float(op),
+            })
+        return result
+    except Exception as e:
+        print(f"[연간 실적 조회 실패] {ticker.ticker}: {e}")
+        return []
+
+
 def fetch_yahoo_quote(yahoo_symbol: str, period: str) -> dict:
-    """야후 파이낸스에서 가격/차트/52주 고저/시가총액 등을 조회.
-    name은 포함하지 않음 (호출부에서 소스에 맞게 채움).
-    period는 프론트엔드 기간 키(1w/1mo/1y/5y/10y/max)이며, 여기서 yfinance
-    period 문자열로 변환해서 사용한다."""
+    """야후 파이낸스에서 가격/차트/52주 고저/시가총액/재무지표/연간 실적을 조회.
+    name은 포함하지 않음 (호출부에서 소스에 맞게 채움)."""
     ticker = yf.Ticker(yahoo_symbol, session=session)
     fast_info = ticker.fast_info
 
@@ -240,12 +315,14 @@ def fetch_yahoo_quote(yahoo_symbol: str, period: str) -> dict:
     change = current_price - previous_close if previous_close else 0
     change_percent = (change / previous_close) * 100 if previous_close else 0
 
-    yf_period = _PERIOD_MAP.get(period, '1mo')
-    history = ticker.history(period=yf_period)
+    history = ticker.history(period=_PERIOD_MAP.get(period, '1mo'))
     chart_data = [
         {"date": date.strftime('%Y-%m-%d'), "close": round(row['Close'], 2)}
         for date, row in history.iterrows()
     ]
+
+    fundamentals = fetch_fundamentals(ticker)
+    financials = fetch_annual_financials(ticker)
 
     return {
         'currentPrice': current_price,
@@ -257,6 +334,8 @@ def fetch_yahoo_quote(yahoo_symbol: str, period: str) -> dict:
         'low52': fast_info.year_low,
         'marketCap': fast_info.market_cap,
         'chart': chart_data,
+        **fundamentals,
+        'financials': financials,
         '_ticker': ticker,  # 이름 조회에 재사용 (응답에는 포함하지 않음)
     }
 
