@@ -59,6 +59,96 @@ def _yahoo_call_with_retry(fn, *args, retries=2, backoff=2.5, **kwargs):
             raise
     raise last_err
 
+
+# ---------------------------------------------------------
+# 야후 quoteSummary(PER/PBR/ROE 등)는 chart API(가격/차트)와 달리 crumb(인증 토큰) +
+# 쿠키 핸드셰이크를 요구한다. yfinance의 ticker.info가 이 핸드셰이크에 실패하는 경우가
+# (특히 Render 등 클라우드 IP에서) 흔해서, crumb를 직접 발급받아 quoteSummary를
+# 수동으로 호출하는 최후 폴백을 둔다.
+# ---------------------------------------------------------
+_yahoo_crumb_cache = {'crumb': None, 'ts': 0.0}
+_YAHOO_CRUMB_TTL = 60 * 60  # crumb는 자주 안 바뀌므로 1시간 캐시
+
+
+def _get_yahoo_crumb():
+    now = time.time()
+    if _yahoo_crumb_cache['crumb'] and (now - _yahoo_crumb_cache['ts']) < _YAHOO_CRUMB_TTL:
+        return _yahoo_crumb_cache['crumb']
+
+    try:
+        # 쿠키를 먼저 확보해야 crumb 발급이 성공할 확률이 높아짐
+        _yahoo_call_with_retry(session.get, 'https://fc.yahoo.com', timeout=6, retries=1)
+    except Exception as e:
+        print(f"[야후 쿠키 확보 실패] {e}")
+
+    try:
+        resp = _yahoo_call_with_retry(
+            session.get, 'https://query2.finance.yahoo.com/v1/test/getcrumb', timeout=6, retries=1
+        )
+        crumb = (resp.text or '').strip()
+        if crumb and len(crumb) < 50 and 'error' not in crumb.lower() and '<html' not in crumb.lower():
+            _yahoo_crumb_cache['crumb'] = crumb
+            _yahoo_crumb_cache['ts'] = now
+            return crumb
+        print(f"[야후 crumb 응답 이상] {crumb[:100]!r}")
+    except Exception as e:
+        print(f"[야후 crumb 발급 실패] {e}")
+    return None
+
+
+def fetch_fundamentals_via_quotesummary(symbol: str) -> dict:
+    """crumb 인증과 함께 quoteSummary API를 직접 호출해 PER/PBR/ROE/부채비율/배당수익률을 조회.
+    ticker.info가 실패했을 때만 호출되는 최후 폴백."""
+    crumb = _get_yahoo_crumb()
+    if not crumb:
+        return {}
+
+    def _raw(v):
+        return v.get('raw') if isinstance(v, dict) else v
+
+    try:
+        url = f'https://query1.finance.yahoo.com/v10/finance/quoteSummary/{symbol}'
+        params = {
+            'modules': 'defaultKeyStatistics,financialData,summaryDetail',
+            'crumb': crumb,
+        }
+        resp = _yahoo_call_with_retry(session.get, url, params=params, timeout=8)
+        data = resp.json()
+        result = (data.get('quoteSummary') or {}).get('result') or []
+        if not result:
+            print(f"[quoteSummary 직접 호출] {symbol}: 결과 없음 - {str(data)[:200]}")
+            return {}
+
+        modules = result[0]
+        key_stats = modules.get('defaultKeyStatistics', {}) or {}
+        fin_data = modules.get('financialData', {}) or {}
+        summary = modules.get('summaryDetail', {}) or {}
+
+        per = _raw(summary.get('trailingPE')) or _raw(key_stats.get('forwardPE'))
+        pbr = _raw(key_stats.get('priceToBook'))
+        roe = _raw(fin_data.get('returnOnEquity'))
+        debt = _raw(fin_data.get('debtToEquity'))
+        raw_div_yield = _raw(summary.get('dividendYield'))
+
+        if raw_div_yield is None or (isinstance(raw_div_yield, float) and raw_div_yield != raw_div_yield):
+            dividend_yield = None
+        elif float(raw_div_yield) > 1.5:
+            dividend_yield = round(float(raw_div_yield), 2)
+        else:
+            dividend_yield = _pct(raw_div_yield)
+
+        print(f"[quoteSummary 직접 호출 성공] {symbol}: PER={per} PBR={pbr} ROE={roe}")
+        return {
+            'per': None if _is_nan(per) else round(float(per), 2),
+            'pbr': None if _is_nan(pbr) else round(float(pbr), 2),
+            'roe': _pct(roe),
+            'debtRatio': None if _is_nan(debt) else round(float(debt), 1),
+            'dividendYield': dividend_yield,
+        }
+    except Exception as e:
+        print(f"[quoteSummary 직접 호출 실패] {symbol}: {e}")
+        return {}
+
 # 프론트엔드 기간 버튼 값 -> yfinance가 실제로 받는 period 문자열 매핑
 # ('1w'는 yfinance에 없는 값이라 가장 가까운 '5d'로 매핑)
 _PERIOD_MAP = {
@@ -308,15 +398,20 @@ def _pct(v):
 def fetch_fundamentals(ticker: "yf.Ticker") -> dict:
     """PER/PBR/ROE/부채비율/배당수익률 등 재무 지표 조회 (ticker.info 사용).
     종목에 따라 일부 지표가 아예 없을 수 있어(ETF 등) 개별적으로 None 처리.
-    ticker.info가 쓰는 야후의 quoteSummary API는 가격/차트에 쓰이는 chart API보다
-    훨씬 자주 차단/타임아웃되므로(특히 클라우드 서버 IP), 스로틀링 + 429 재시도를 적용한다."""
+    ticker.info가 쓰는 야후의 quoteSummary API는 가격/차트에 쓰이는 chart API와 달리
+    crumb(인증 토큰) 핸드셰이크가 필요해서, 클라우드 서버 IP에서는 구조적으로
+    막히는 경우가 흔하다. yfinance 내장 경로가 실패하면 crumb를 직접 발급받아
+    quoteSummary를 수동으로 호출하는 폴백을 시도한다."""
     try:
         info = _yahoo_call_with_retry(lambda: ticker.info or {})
     except Exception as e:
-        print(f"[재무지표 조회 실패] {ticker.ticker}: {e}")
+        print(f"[재무지표 조회 실패 - ticker.info] {ticker.ticker}: {e}")
         info = {}
 
     if not info:
+        fallback = fetch_fundamentals_via_quotesummary(ticker.ticker)
+        if fallback:
+            return fallback
         return {'per': None, 'pbr': None, 'roe': None, 'debtRatio': None, 'dividendYield': None}
 
     per = info.get('trailingPE')
