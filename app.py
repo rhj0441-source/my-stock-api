@@ -642,7 +642,30 @@ def fetch_yahoo_quote(yahoo_symbol: str, period: str, light: bool = False) -> di
         fi = ticker.fast_info
         return fi.last_price, fi.previous_close, fi.currency, fi.year_high, fi.year_low, fi.market_cap
 
-    current_price, previous_close, currency, year_high, year_low, market_cap = _yahoo_call_with_retry(_read_fast_info)
+    def _read_history():
+        return _yahoo_call_with_retry(ticker.history, period=_PERIOD_MAP.get(period, '1mo'))
+
+    # fast_info/history/fundamentals/financials는 서로 독립적인 호출이라
+    # 순차 실행 대신 스레드로 동시에 시작한다. 실제 야후 전송은 여전히
+    # _yahoo_call_with_retry의 전역 스로틀(0.4초 간격)로 줄을 서지만,
+    # 각 호출의 "응답 대기" 구간이 서로 겹치게 되어 종목 하나당 걸리는
+    # 총 시간이 (순차 합산) 대신 (가장 느린 호출 기준)에 가까워진다.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        fast_info_fut = executor.submit(_yahoo_call_with_retry, _read_fast_info)
+        history_fut = executor.submit(_read_history)
+        if light:
+            fundamentals_fut = None
+            financials_fut = None
+        else:
+            fundamentals_fut = executor.submit(fetch_fundamentals, ticker)
+            financials_fut = executor.submit(fetch_annual_financials, ticker)
+
+        current_price, previous_close, currency, year_high, year_low, market_cap = fast_info_fut.result()
+        history = history_fut.result()
+        fundamentals = fundamentals_fut.result() if fundamentals_fut else {
+            'per': None, 'pbr': None, 'roe': None, 'debtRatio': None, 'dividendYield': None
+        }
+        financials = financials_fut.result() if financials_fut else []
 
     if current_price is None:
         raise ValueError("데이터 없음")
@@ -650,18 +673,10 @@ def fetch_yahoo_quote(yahoo_symbol: str, period: str, light: bool = False) -> di
     change = current_price - previous_close if previous_close else 0
     change_percent = (change / previous_close) * 100 if previous_close else 0
 
-    history = _yahoo_call_with_retry(ticker.history, period=_PERIOD_MAP.get(period, '1mo'))
     chart_data = [
         {"date": date.strftime('%Y-%m-%d'), "close": round(row['Close'], 2)}
         for date, row in history.iterrows()
     ]
-
-    if light:
-        fundamentals = {'per': None, 'pbr': None, 'roe': None, 'debtRatio': None, 'dividendYield': None}
-        financials = []
-    else:
-        fundamentals = fetch_fundamentals(ticker)
-        financials = fetch_annual_financials(ticker)
 
     return {
         'currentPrice': current_price,
@@ -697,11 +712,15 @@ def is_kr_code(code: str) -> bool:
 def get_kr_stock():
     code = request.args.get('code', '').strip().upper()
     period = resolve_period(request.args.get('period'))
+    # light=1이면 PER/PBR/재무제표(및 그 보강용 pykrx/DART 폴백 체인)를 모두 건너뛰고
+    # 가격/등락률/차트만 빠르게 반환한다. 즐겨찾기 목록처럼 이름/가격/스파크라인만
+    # 필요한 화면에 사용해 야후·DART 호출 횟수와 응답 시간을 크게 줄이기 위함.
+    light = request.args.get('light', '').strip().lower() in ('1', 'true', 'yes')
 
     if not is_kr_code(code):
         return jsonify({'error': '국내 종목 코드는 6자리 코드여야 합니다.'}), 400
 
-    cache_key = f"KR:{code}:{period}"
+    cache_key = f"KR:{code}:{period}:{'light' if light else 'full'}"
     cached = get_cached_stock(cache_key)
     if cached:
         return jsonify(cached)
@@ -709,7 +728,7 @@ def get_kr_stock():
     yahoo_symbol = code + get_yahoo_suffix(code)
 
     try:
-        quote = fetch_yahoo_quote(yahoo_symbol, period)
+        quote = fetch_yahoo_quote(yahoo_symbol, period, light=light)
         ticker = quote.pop('_ticker')
 
         # 1순위: KRX 종목명 벌크 캐시. 2순위: 개별 보강 조회(pykrx).
@@ -722,19 +741,20 @@ def get_kr_stock():
             **quote,
         }
 
-        # 야후 quoteSummary가 막혀 PER/PBR/배당수익률이 비어있으면 pykrx(KRX 원천)로 보강
-        if result.get('per') is None or result.get('pbr') is None:
-            fallback_fund = fetch_kr_fundamentals_pykrx(code)
-            for k, v in fallback_fund.items():
-                if result.get(k) is None and v is not None:
-                    result[k] = v
+        if not light:
+            # 야후 quoteSummary가 막혀 PER/PBR/배당수익률이 비어있으면 pykrx(KRX 원천)로 보강
+            if result.get('per') is None or result.get('pbr') is None:
+                fallback_fund = fetch_kr_fundamentals_pykrx(code)
+                for k, v in fallback_fund.items():
+                    if result.get(k) is None and v is not None:
+                        result[k] = v
 
-        # pykrx도 막혀있으면 DART(정부 공식 API, IP 차단 없음)로 최종 보강
-        if result.get('per') is None or result.get('pbr') is None or result.get('roe') is None:
-            dart_fund = fetch_kr_fundamentals_dart(code, result.get('marketCap'))
-            for k, v in dart_fund.items():
-                if result.get(k) is None and v is not None:
-                    result[k] = v
+            # pykrx도 막혀있으면 DART(정부 공식 API, IP 차단 없음)로 최종 보강
+            if result.get('per') is None or result.get('pbr') is None or result.get('roe') is None:
+                dart_fund = fetch_kr_fundamentals_dart(code, result.get('marketCap'))
+                for k, v in dart_fund.items():
+                    if result.get(k) is None and v is not None:
+                        result[k] = v
 
         set_cached_stock(cache_key, result)
         return jsonify(result)
