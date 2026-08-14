@@ -15,6 +15,50 @@ CORS(app)
 # 차단 우회를 위한 브라우저 세션 생성 (Chrome 브라우저 위장, 해외 종목 조회에 사용)
 session = requests_cffi.Session(impersonate="chrome110")
 
+# ---------------------------------------------------------
+# 야후 파이낸스 호출 스로틀링 (Too Many Requests / 429 방지)
+# 여러 요청(즐겨찾기, 지수 위젯 등)이 동시에 몰리면 짧은 시간에 야후로 나가는
+# 호출이 급증해 IP 단위로 레이트리밋(429)에 걸리기 쉽다. 앱 전체에서 공유하는
+# 최소 호출 간격을 두어 순간적으로 몰리는 요청을 자연스럽게 줄지어 세운다.
+# ---------------------------------------------------------
+_yahoo_call_lock = threading.Lock()
+_yahoo_last_call_ts = 0.0
+_YAHOO_MIN_INTERVAL = 0.4  # 최소 호출 간격(초). 대략 초당 2~3회로 제한.
+
+
+def _throttle_yahoo_call():
+    global _yahoo_last_call_ts
+    with _yahoo_call_lock:
+        now = time.time()
+        wait = _YAHOO_MIN_INTERVAL - (now - _yahoo_last_call_ts)
+        if wait > 0:
+            time.sleep(wait)
+        _yahoo_last_call_ts = time.time()
+
+
+def _is_rate_limit_error(e: Exception) -> bool:
+    msg = str(e)
+    return 'Too Many Requests' in msg or 'Rate limited' in msg or '429' in msg
+
+
+def _yahoo_call_with_retry(fn, *args, retries=2, backoff=2.5, **kwargs):
+    """야후 API 호출을 스로틀링 + 429(Too Many Requests) 발생 시 자동 재시도로 감싼다."""
+    last_err = None
+    wait = backoff
+    for attempt in range(retries + 1):
+        _throttle_yahoo_call()
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            last_err = e
+            if _is_rate_limit_error(e) and attempt < retries:
+                print(f"[야후 레이트리밋] {attempt + 1}번째 시도 실패, {wait:.1f}초 대기 후 재시도")
+                time.sleep(wait)
+                wait *= 1.8
+                continue
+            raise
+    raise last_err
+
 # 프론트엔드 기간 버튼 값 -> yfinance가 실제로 받는 period 문자열 매핑
 # ('1w'는 yfinance에 없는 값이라 가장 가까운 '5d'로 매핑)
 _PERIOD_MAP = {
@@ -205,7 +249,7 @@ def get_foreign_name(symbol: str, ticker: "yf.Ticker" = None):
 
         try:
             t = ticker or yf.Ticker(symbol, session=session)
-            info = t.info
+            info = _yahoo_call_with_retry(lambda: t.info)
             name = info.get('longName') or info.get('shortName')
         except Exception as e:
             print(f"[해외 종목명 조회 실패] {symbol}: {e}")
@@ -265,21 +309,14 @@ def fetch_fundamentals(ticker: "yf.Ticker") -> dict:
     """PER/PBR/ROE/부채비율/배당수익률 등 재무 지표 조회 (ticker.info 사용).
     종목에 따라 일부 지표가 아예 없을 수 있어(ETF 등) 개별적으로 None 처리.
     ticker.info가 쓰는 야후의 quoteSummary API는 가격/차트에 쓰이는 chart API보다
-    훨씬 자주 차단/타임아웃되므로(특히 클라우드 서버 IP), 실패 시 짧게 한 번 재시도한다."""
-    info = {}
-    last_error = None
-    for attempt in range(2):
-        try:
-            info = ticker.info or {}
-            if info:
-                break
-        except Exception as e:
-            last_error = e
-            info = {}
-            time.sleep(0.5)
+    훨씬 자주 차단/타임아웃되므로(특히 클라우드 서버 IP), 스로틀링 + 429 재시도를 적용한다."""
+    try:
+        info = _yahoo_call_with_retry(lambda: ticker.info or {})
+    except Exception as e:
+        print(f"[재무지표 조회 실패] {ticker.ticker}: {e}")
+        info = {}
 
     if not info:
-        print(f"[재무지표 조회 실패] {ticker.ticker}: {last_error}")
         return {'per': None, 'pbr': None, 'roe': None, 'debtRatio': None, 'dividendYield': None}
 
     per = info.get('trailingPE')
@@ -312,7 +349,7 @@ def fetch_annual_financials(ticker: "yf.Ticker") -> list:
     """최근 4개년 매출액/영업이익 조회 (연간 손익계산서 기준).
     ETF 등 손익계산서가 없는 종목은 빈 리스트를 반환한다."""
     try:
-        fin = ticker.financials
+        fin = _yahoo_call_with_retry(lambda: ticker.financials)
         if fin is None or fin.empty:
             return []
 
@@ -348,10 +385,12 @@ def fetch_yahoo_quote(yahoo_symbol: str, period: str, light: bool = False) -> di
     지수(코스피/나스닥 등)처럼 애초에 재무지표가 없는 대상이나, 위젯처럼 가격만
     빠르게 필요한 경우 야후 호출 횟수를 줄여 응답 속도를 크게 개선한다."""
     ticker = yf.Ticker(yahoo_symbol, session=session)
-    fast_info = ticker.fast_info
 
-    current_price = fast_info.last_price
-    previous_close = fast_info.previous_close
+    def _read_fast_info():
+        fi = ticker.fast_info
+        return fi.last_price, fi.previous_close, fi.currency, fi.year_high, fi.year_low, fi.market_cap
+
+    current_price, previous_close, currency, year_high, year_low, market_cap = _yahoo_call_with_retry(_read_fast_info)
 
     if current_price is None:
         raise ValueError("데이터 없음")
@@ -359,7 +398,7 @@ def fetch_yahoo_quote(yahoo_symbol: str, period: str, light: bool = False) -> di
     change = current_price - previous_close if previous_close else 0
     change_percent = (change / previous_close) * 100 if previous_close else 0
 
-    history = ticker.history(period=_PERIOD_MAP.get(period, '1mo'))
+    history = _yahoo_call_with_retry(ticker.history, period=_PERIOD_MAP.get(period, '1mo'))
     chart_data = [
         {"date": date.strftime('%Y-%m-%d'), "close": round(row['Close'], 2)}
         for date, row in history.iterrows()
@@ -377,10 +416,10 @@ def fetch_yahoo_quote(yahoo_symbol: str, period: str, light: bool = False) -> di
         'previousClose': previous_close,
         'change': change,
         'changePercent': change_percent,
-        'currency': fast_info.currency or 'USD',
-        'high52': fast_info.year_high,
-        'low52': fast_info.year_low,
-        'marketCap': fast_info.market_cap,
+        'currency': currency or 'USD',
+        'high52': year_high,
+        'low52': year_low,
+        'marketCap': market_cap,
         'chart': chart_data,
         **fundamentals,
         'financials': financials,
@@ -528,7 +567,7 @@ def run_marketcap_screen(region: str, offset: int, count: int):
         EquityQuery('eq', ['region', region]),
         EquityQuery('gt', ['intradaymarketcap', 0]),
     ])
-    result = yf.screen(q, sortField='intradaymarketcap', sortAsc=False, offset=offset, size=count)
+    result = _yahoo_call_with_retry(yf.screen, q, sortField='intradaymarketcap', sortAsc=False, offset=offset, size=count)
     quotes = result.get('quotes', []) if result else []
     raw_count = len(quotes)
 
