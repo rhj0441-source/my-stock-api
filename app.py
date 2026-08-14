@@ -156,8 +156,9 @@ def fetch_kr_fundamentals_pykrx(code: str) -> dict:
         from pykrx import stock as pykrx_stock
         from datetime import datetime, timedelta
 
-        # 휴장일(주말/공휴일) 대비 최근 영업일을 최대 7일 전까지 역순으로 탐색
-        for days_back in range(7):
+        # 휴장일(주말/공휴일) 대비 최근 영업일을 최대 3일 전까지 역순으로 탐색
+        # (너무 길게 탐색하면 실패 시 응답이 느려지므로 범위를 짧게 유지)
+        for days_back in range(3):
             date_str = (datetime.now() - timedelta(days=days_back)).strftime('%Y%m%d')
             df = pykrx_stock.get_market_fundamental(date_str, date_str, code)
             if df is None or df.empty:
@@ -340,9 +341,12 @@ def fetch_annual_financials(ticker: "yf.Ticker") -> list:
         return []
 
 
-def fetch_yahoo_quote(yahoo_symbol: str, period: str) -> dict:
+def fetch_yahoo_quote(yahoo_symbol: str, period: str, light: bool = False) -> dict:
     """야후 파이낸스에서 가격/차트/52주 고저/시가총액/재무지표/연간 실적을 조회.
-    name은 포함하지 않음 (호출부에서 소스에 맞게 채움)."""
+    name은 포함하지 않음 (호출부에서 소스에 맞게 채움).
+    light=True면 PER/PBR/ROE 등 재무지표와 연간 실적 조회를 건너뛴다.
+    지수(코스피/나스닥 등)처럼 애초에 재무지표가 없는 대상이나, 위젯처럼 가격만
+    빠르게 필요한 경우 야후 호출 횟수를 줄여 응답 속도를 크게 개선한다."""
     ticker = yf.Ticker(yahoo_symbol, session=session)
     fast_info = ticker.fast_info
 
@@ -361,8 +365,12 @@ def fetch_yahoo_quote(yahoo_symbol: str, period: str) -> dict:
         for date, row in history.iterrows()
     ]
 
-    fundamentals = fetch_fundamentals(ticker)
-    financials = fetch_annual_financials(ticker)
+    if light:
+        fundamentals = {'per': None, 'pbr': None, 'roe': None, 'debtRatio': None, 'dividendYield': None}
+        financials = []
+    else:
+        fundamentals = fetch_fundamentals(ticker)
+        financials = fetch_annual_financials(ticker)
 
     return {
         'currentPrice': current_price,
@@ -448,22 +456,26 @@ def get_kr_stock():
 def get_global_stock():
     symbol = request.args.get('symbol', '').strip().upper()
     period = resolve_period(request.args.get('period'))
+    # light=1이면 이름 조회(ticker.info)와 PER/PBR/재무제표 조회를 모두 건너뛰고
+    # 가격/등락률/차트만 빠르게 반환한다. 지수 위젯처럼 이름·재무지표가 필요 없는
+    # 호출에 사용해 야후 API 호출 횟수를 줄이기 위함.
+    light = request.args.get('light', '').strip().lower() in ('1', 'true', 'yes')
 
     if not symbol:
         return jsonify({'error': '종목 코드를 입력해주세요.'}), 400
 
-    cache_key = f"G:{symbol}:{period}"
+    cache_key = f"G:{symbol}:{period}:{'light' if light else 'full'}"
     cached = get_cached_stock(cache_key)
     if cached:
         return jsonify(cached)
 
     try:
-        quote = fetch_yahoo_quote(symbol, period)
+        quote = fetch_yahoo_quote(symbol, period, light=light)
         ticker = quote.pop('_ticker')
 
         result = {
             'symbol': symbol,
-            'name': get_foreign_name(symbol, ticker),
+            'name': None if light else get_foreign_name(symbol, ticker),
             **quote,
         }
         set_cached_stock(cache_key, result)
