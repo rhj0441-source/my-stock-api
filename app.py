@@ -148,6 +148,34 @@ def resolve_missing_kr_name(code: str):
     return None
 
 
+def fetch_kr_fundamentals_pykrx(code: str) -> dict:
+    """야후(quoteSummary)에서 PER/PBR/배당수익률을 못 가져왔을 때
+    KRX 원천 데이터를 쓰는 pykrx로 보강 조회한다.
+    pykrx 기본 API에는 ROE/부채비율이 없어 PER/PBR/배당수익률만 채운다."""
+    try:
+        from pykrx import stock as pykrx_stock
+        from datetime import datetime, timedelta
+
+        # 휴장일(주말/공휴일) 대비 최근 영업일을 최대 7일 전까지 역순으로 탐색
+        for days_back in range(7):
+            date_str = (datetime.now() - timedelta(days=days_back)).strftime('%Y%m%d')
+            df = pykrx_stock.get_market_fundamental(date_str, date_str, code)
+            if df is None or df.empty:
+                continue
+            row = df.iloc[-1]
+            per = row.get('PER')
+            pbr = row.get('PBR')
+            div = row.get('DIV')
+            return {
+                'per': round(float(per), 2) if per not in (None, 0) and per == per else None,
+                'pbr': round(float(pbr), 2) if pbr not in (None, 0) and pbr == pbr else None,
+                'dividendYield': round(float(div), 2) if div is not None and div == div and div != 0 else None,
+            }
+    except Exception as e:
+        print(f"[pykrx 재무지표 보강 실패] {code}: {e}")
+    return {}
+
+
 def get_yahoo_suffix(code: str) -> str:
     """국내 종목 코드에 붙일 야후 파이낸스 접미사를 시장구분에 따라 결정.
     코스닥이면 '.KQ', 그 외(코스피/ETF 등)는 '.KS'."""
@@ -234,11 +262,23 @@ def _pct(v):
 
 def fetch_fundamentals(ticker: "yf.Ticker") -> dict:
     """PER/PBR/ROE/부채비율/배당수익률 등 재무 지표 조회 (ticker.info 사용).
-    종목에 따라 일부 지표가 아예 없을 수 있어(ETF 등) 개별적으로 None 처리."""
-    try:
-        info = ticker.info or {}
-    except Exception as e:
-        print(f"[재무지표 조회 실패] {ticker.ticker}: {e}")
+    종목에 따라 일부 지표가 아예 없을 수 있어(ETF 등) 개별적으로 None 처리.
+    ticker.info가 쓰는 야후의 quoteSummary API는 가격/차트에 쓰이는 chart API보다
+    훨씬 자주 차단/타임아웃되므로(특히 클라우드 서버 IP), 실패 시 짧게 한 번 재시도한다."""
+    info = {}
+    last_error = None
+    for attempt in range(2):
+        try:
+            info = ticker.info or {}
+            if info:
+                break
+        except Exception as e:
+            last_error = e
+            info = {}
+            time.sleep(0.5)
+
+    if not info:
+        print(f"[재무지표 조회 실패] {ticker.ticker}: {last_error}")
         return {'per': None, 'pbr': None, 'roe': None, 'debtRatio': None, 'dividendYield': None}
 
     per = info.get('trailingPE')
@@ -382,6 +422,14 @@ def get_kr_stock():
             'name': name,
             **quote,
         }
+
+        # 야후 quoteSummary가 막혀 PER/PBR/배당수익률이 비어있으면 pykrx(KRX 원천)로 보강
+        if result.get('per') is None or result.get('pbr') is None:
+            fallback_fund = fetch_kr_fundamentals_pykrx(code)
+            for k, v in fallback_fund.items():
+                if result.get(k) is None and v is not None:
+                    result[k] = v
+
         set_cached_stock(cache_key, result)
         return jsonify(result)
 
