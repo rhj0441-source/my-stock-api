@@ -311,6 +311,180 @@ def fetch_kr_fundamentals_pykrx(code: str) -> dict:
     return {}
 
 
+# ---------------------------------------------------------
+# DART(전자공시) OpenAPI 무료 폴백 - 국내 종목 PER/PBR/ROE
+# 야후 quoteSummary(crumb)와 pykrx가 모두 클라우드 IP 차단으로 막힐 때 쓰는
+# 최종 폴백. DART는 정부 공식 REST API라 IP 차단이 없다.
+# 무료 키 발급: https://opendart.fss.or.kr (이메일 인증 후 즉시 발급, 환경변수 DART_API_KEY에 설정)
+# 주당 지표(EPS/BPS) 대신 회사 전체 지표(시가총액/순이익, 시가총액/자본총계)를
+# 사용해서 계산 -> 발행주식수를 따로 조회할 필요가 없어 구현이 단순해짐.
+# ---------------------------------------------------------
+DART_API_KEY = os.environ.get('DART_API_KEY', '')
+
+_dart_corp_code_cache = {}  # {'005930': '00126380', ...} 종목코드 -> DART 고유번호
+_dart_corp_code_lock = threading.Lock()
+_dart_corp_code_updated_at = 0
+_DART_CORP_CODE_TTL = 24 * 60 * 60  # 24시간
+
+
+def _load_dart_corp_codes() -> dict:
+    """DART가 제공하는 전체 상장사 corp_code 매핑표(zip 안의 XML)를 내려받아 캐싱."""
+    global _dart_corp_code_cache, _dart_corp_code_updated_at
+    if not DART_API_KEY:
+        return {}
+
+    now = time.time()
+    if _dart_corp_code_cache and (now - _dart_corp_code_updated_at) < _DART_CORP_CODE_TTL:
+        return _dart_corp_code_cache
+
+    with _dart_corp_code_lock:
+        now = time.time()
+        if _dart_corp_code_cache and (now - _dart_corp_code_updated_at) < _DART_CORP_CODE_TTL:
+            return _dart_corp_code_cache
+
+        try:
+            import zipfile
+            import io
+            import xml.etree.ElementTree as ET
+
+            resp = requests_cffi.get(
+                'https://opendart.fss.or.kr/api/corpCode.xml',
+                params={'crtfc_key': DART_API_KEY},
+                timeout=15,
+            )
+            zf = zipfile.ZipFile(io.BytesIO(resp.content))
+            xml_bytes = zf.read('CORPCODE.xml')
+            root = ET.fromstring(xml_bytes)
+
+            new_map = {}
+            for item in root.iter('list'):
+                stock_code = (item.findtext('stock_code') or '').strip()
+                corp_code = (item.findtext('corp_code') or '').strip()
+                if stock_code and corp_code:
+                    new_map[stock_code.zfill(6)] = corp_code
+
+            if new_map:
+                _dart_corp_code_cache = new_map
+                _dart_corp_code_updated_at = now
+                print(f"[DART corp_code 캐시] {len(new_map)}개 종목 매핑 완료")
+        except Exception as e:
+            print(f"[DART corp_code 캐시 갱신 실패] {e}")
+
+        return _dart_corp_code_cache
+
+
+def fetch_kr_fundamentals_dart(code: str, market_cap) -> dict:
+    """DART 재무제표(당기순이익/자본총계)로 PER/PBR/ROE를 계산.
+    pykrx/야후가 모두 막혔을 때의 최종 폴백."""
+    if not DART_API_KEY or not market_cap:
+        return {}
+
+    corp_map = _load_dart_corp_codes()
+    corp_code = corp_map.get(code)
+    if not corp_code:
+        return {}
+
+    from datetime import datetime
+    this_year = datetime.now().year
+
+    # 최신 사업보고서(11011)부터 역순으로 최대 2개년 탐색
+    # (연초에는 아직 전년도 사업보고서가 안 올라온 경우가 있어서)
+    for year in (this_year - 1, this_year - 2):
+        for fs_div in ('CFS', 'OFS'):  # 연결재무제표 우선, 없으면 개별재무제표
+            try:
+                resp = requests_cffi.get(
+                    'https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json',
+                    params={
+                        'crtfc_key': DART_API_KEY,
+                        'corp_code': corp_code,
+                        'bsns_year': str(year),
+                        'reprt_code': '11011',
+                        'fs_div': fs_div,
+                    },
+                    timeout=10,
+                )
+                data = resp.json()
+                rows = data.get('list') or []
+                if not rows:
+                    continue
+
+                net_income = None
+                total_equity = None
+                for row in rows:
+                    name = (row.get('account_nm') or '').strip()
+                    amt = row.get('thstrm_amount')
+                    if amt in (None, ''):
+                        continue
+                    try:
+                        amt_val = float(str(amt).replace(',', ''))
+                    except ValueError:
+                        continue
+                    if name == '당기순이익' and net_income is None:
+                        net_income = amt_val
+                    elif name == '자본총계' and total_equity is None:
+                        total_equity = amt_val
+
+                if net_income is None and total_equity is None:
+                    continue
+
+                result = {}
+                if total_equity:
+                    result['pbr'] = round(market_cap / total_equity, 2)
+                    if net_income is not None:
+                        result['roe'] = round((net_income / total_equity) * 100, 2)
+                if net_income:
+                    result['per'] = round(market_cap / net_income, 2)
+
+                if result:
+                    print(f"[DART 재무지표 보강 성공] {code} ({year}년/{fs_div}): {result}")
+                    return result
+            except Exception as e:
+                print(f"[DART 재무지표 조회 실패] {code} ({year}년/{fs_div}): {e}")
+                continue
+
+    return {}
+
+
+# ---------------------------------------------------------
+# Finnhub 무료 API 폴백 - 해외 종목 PER/PBR/ROE
+# 야후 quoteSummary가 클라우드 IP 차단으로 막혔을 때의 해외 종목용 폴백.
+# 무료 키 발급: https://finnhub.io (가입 즉시 발급, 분당 60회 제한, 환경변수 FINNHUB_API_KEY에 설정)
+# ---------------------------------------------------------
+FINNHUB_API_KEY = os.environ.get('FINNHUB_API_KEY', '')
+
+
+def fetch_us_fundamentals_finnhub(symbol: str) -> dict:
+    if not FINNHUB_API_KEY:
+        return {}
+    try:
+        resp = requests_cffi.get(
+            'https://finnhub.io/api/v1/stock/metric',
+            params={'symbol': symbol, 'metric': 'all', 'token': FINNHUB_API_KEY},
+            timeout=8,
+        )
+        data = resp.json()
+        metric = data.get('metric') or {}
+        if not metric:
+            return {}
+
+        per = metric.get('peTTM') or metric.get('peBasicExclExtraTTM')
+        pbr = metric.get('pb')
+        roe = metric.get('roeTTM')
+
+        result = {
+            'per': None if _is_nan(per) else round(float(per), 2),
+            'pbr': None if _is_nan(pbr) else round(float(pbr), 2),
+            'roe': None if _is_nan(roe) else round(float(roe), 2),
+        }
+        result = {k: v for k, v in result.items() if v is not None}
+        if result:
+            print(f"[Finnhub 재무지표 보강 성공] {symbol}: {result}")
+        return result
+    except Exception as e:
+        print(f"[Finnhub 재무지표 조회 실패] {symbol}: {e}")
+        return {}
+
+
 def get_yahoo_suffix(code: str) -> str:
     """국내 종목 코드에 붙일 야후 파이낸스 접미사를 시장구분에 따라 결정.
     코스닥이면 '.KQ', 그 외(코스피/ETF 등)는 '.KS'."""
@@ -399,19 +573,20 @@ def fetch_fundamentals(ticker: "yf.Ticker") -> dict:
     """PER/PBR/ROE/부채비율/배당수익률 등 재무 지표 조회 (ticker.info 사용).
     종목에 따라 일부 지표가 아예 없을 수 있어(ETF 등) 개별적으로 None 처리.
     ticker.info가 쓰는 야후의 quoteSummary API는 가격/차트에 쓰이는 chart API와 달리
-    crumb(인증 토큰) 핸드셰이크가 필요해서, 클라우드 서버 IP에서는 구조적으로
-    막히는 경우가 흔하다. yfinance 내장 경로가 실패하면 crumb를 직접 발급받아
-    quoteSummary를 수동으로 호출하는 폴백을 시도한다."""
+    crumb(인증 토큰) 핸드셰이크가 필요해서, 클라우드 서버 IP(Render 등)에서는
+    거의 항상 'Invalid Crumb'로 거부된다. 재시도/수동 crumb 폴백 모두 결국 실패하는데
+    시간만 잡아먹어(요청당 수십 초 -> 게이트웨이 타임아웃 원인) retries=0으로 1회만
+    시도하고, 실패하면 바로 포기해서 pykrx/DART/Finnhub 같은 살아있는 폴백에
+    빨리 넘어가도록 한다."""
     try:
-        info = _yahoo_call_with_retry(lambda: ticker.info or {})
+        info = _yahoo_call_with_retry(lambda: ticker.info or {}, retries=0)
     except Exception as e:
         print(f"[재무지표 조회 실패 - ticker.info] {ticker.ticker}: {e}")
         info = {}
 
     if not info:
-        fallback = fetch_fundamentals_via_quotesummary(ticker.ticker)
-        if fallback:
-            return fallback
+        # 야후 crumb 수동 폴백은 클라우드 IP에서 구조적으로 막혀 있어(Invalid Crumb)
+        # 더 이상 시도하지 않는다. pykrx/DART/Finnhub 폴백이 호출부에서 이어서 처리한다.
         return {'per': None, 'pbr': None, 'roe': None, 'debtRatio': None, 'dividendYield': None}
 
     per = info.get('trailingPE')
@@ -572,6 +747,13 @@ def get_kr_stock():
                 if result.get(k) is None and v is not None:
                     result[k] = v
 
+        # pykrx도 막혀있으면 DART(정부 공식 API, IP 차단 없음)로 최종 보강
+        if result.get('per') is None or result.get('pbr') is None or result.get('roe') is None:
+            dart_fund = fetch_kr_fundamentals_dart(code, result.get('marketCap'))
+            for k, v in dart_fund.items():
+                if result.get(k) is None and v is not None:
+                    result[k] = v
+
         set_cached_stock(cache_key, result)
         return jsonify(result)
 
@@ -612,6 +794,16 @@ def get_global_stock():
             'name': None if light else get_foreign_name(symbol, ticker),
             **quote,
         }
+
+        # 야후 quoteSummary가 막혀 PER/PBR/ROE가 비어있으면 Finnhub(정식 API)로 보강
+        if not light and (
+            result.get('per') is None or result.get('pbr') is None or result.get('roe') is None
+        ):
+            finnhub_fund = fetch_us_fundamentals_finnhub(symbol)
+            for k, v in finnhub_fund.items():
+                if result.get(k) is None and v is not None:
+                    result[k] = v
+
         set_cached_stock(cache_key, result)
         return jsonify(result)
 
