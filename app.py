@@ -315,11 +315,25 @@ def _load_dart_corp_codes() -> dict:
             import io
             import xml.etree.ElementTree as ET
 
-            resp = requests_cffi.get(
-                'https://opendart.fss.or.kr/api/corpCode.xml',
-                params={'crtfc_key': DART_API_KEY},
-                timeout=15,
-            )
+            # 브라우저 위장 없는 맨 요청(requests_cffi.get)은 DART 쪽에서 순간적으로
+            # 끊기는 경우가 있어(2~3초 만에 connection timeout), 이미 야후 호출에
+            # 쓰던 크롬 위장 세션(session)을 재사용한다. 실패 시 1회 재시도.
+            resp = None
+            last_err = None
+            for attempt in range(2):
+                try:
+                    resp = session.get(
+                        'https://opendart.fss.or.kr/api/corpCode.xml',
+                        params={'crtfc_key': DART_API_KEY},
+                        timeout=30,
+                    )
+                    break
+                except Exception as e:
+                    last_err = e
+                    time.sleep(1.5)
+            if resp is None:
+                raise last_err
+
             zf = zipfile.ZipFile(io.BytesIO(resp.content))
             xml_bytes = zf.read('CORPCODE.xml')
             root = ET.fromstring(xml_bytes)
@@ -360,7 +374,7 @@ def fetch_kr_fundamentals_dart(code: str, market_cap) -> dict:
     for year in (this_year - 1, this_year - 2):
         for fs_div in ('CFS', 'OFS'):  # 연결재무제표 우선, 없으면 개별재무제표
             try:
-                resp = requests_cffi.get(
+                resp = session.get(
                     'https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json',
                     params={
                         'crtfc_key': DART_API_KEY,
@@ -369,7 +383,7 @@ def fetch_kr_fundamentals_dart(code: str, market_cap) -> dict:
                         'reprt_code': '11011',
                         'fs_div': fs_div,
                     },
-                    timeout=10,
+                    timeout=15,
                 )
                 data = resp.json()
                 rows = data.get('list') or []
