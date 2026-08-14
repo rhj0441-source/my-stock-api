@@ -264,50 +264,18 @@ def get_krx_name_map():
 def resolve_missing_kr_name(code: str):
     """FDR/KIND 벌크 목록에 없는 코드(스핀오프/홀딩스 등 특수 코드, 최근 상장,
     데이터 소스 누락 등)를 개별적으로 보강 조회한다.
-    pykrx는 KRX를 직접 소스로 쓰므로 FDR/KIND와 커버리지가 달라
-    벌크 목록에서 빠진 종목도 잡히는 경우가 많다.
-    성공하면 전역 캐시에 영구 반영해 다음부터는 벌크 캐시처럼 즉시 반환된다."""
-    global _krx_name_cache
-    if code in _krx_name_cache:
-        return _krx_name_cache[code]
-    try:
-        from pykrx import stock as pykrx_stock
-        name = pykrx_stock.get_market_ticker_name(code)
-        if name:
-            with _krx_cache_lock:
-                _krx_name_cache[code] = name
-            return name
-    except Exception as e:
-        print(f"[개별 종목명 보강 실패] {code}: {e}")
-    return None
+    예전에는 pykrx로 보강했으나, pykrx가 최근 KRX 로그인(KRX_ID/KRX_PW)을
+    요구하도록 바뀌면서 매번 실패할 뿐 아니라, 락 대기 중 요청이 무한정
+    멈춰 서버가 타임아웃으로 죽는 문제까지 일으켜 완전히 비활성화한다.
+    벌크 캐시에 없는 종목은 이후 get_foreign_name(야후 이름)으로 폴백된다."""
+    return _krx_name_cache.get(code)
 
 
 def fetch_kr_fundamentals_pykrx(code: str) -> dict:
-    """야후(quoteSummary)에서 PER/PBR/배당수익률을 못 가져왔을 때
-    KRX 원천 데이터를 쓰는 pykrx로 보강 조회한다.
-    pykrx 기본 API에는 ROE/부채비율이 없어 PER/PBR/배당수익률만 채운다."""
-    try:
-        from pykrx import stock as pykrx_stock
-        from datetime import datetime, timedelta
-
-        # 휴장일(주말/공휴일) 대비 최근 영업일을 최대 3일 전까지 역순으로 탐색
-        # (너무 길게 탐색하면 실패 시 응답이 느려지므로 범위를 짧게 유지)
-        for days_back in range(3):
-            date_str = (datetime.now() - timedelta(days=days_back)).strftime('%Y%m%d')
-            df = pykrx_stock.get_market_fundamental(date_str, date_str, code)
-            if df is None or df.empty:
-                continue
-            row = df.iloc[-1]
-            per = row.get('PER')
-            pbr = row.get('PBR')
-            div = row.get('DIV')
-            return {
-                'per': round(float(per), 2) if per not in (None, 0) and per == per else None,
-                'pbr': round(float(pbr), 2) if pbr not in (None, 0) and pbr == pbr else None,
-                'dividendYield': round(float(div), 2) if div is not None and div == div and div != 0 else None,
-            }
-    except Exception as e:
-        print(f"[pykrx 재무지표 보강 실패] {code}: {e}")
+    """예전에는 pykrx로 PER/PBR/배당수익률을 보강했으나, pykrx가 최근 KRX
+    로그인(KRX_ID/KRX_PW)을 요구하도록 바뀌면서 항상 실패하고, 경우에 따라
+    응답이 멈춰 서버가 타임아웃으로 죽는 문제까지 있어 완전히 비활성화한다.
+    같은 역할은 아래 fetch_kr_fundamentals_dart()가 대체한다."""
     return {}
 
 
