@@ -25,6 +25,24 @@ _yahoo_call_lock = threading.Lock()
 _yahoo_last_call_ts = 0.0
 _YAHOO_MIN_INTERVAL = 0.4  # 최소 호출 간격(초). 대략 초당 2~3회로 제한.
 
+# ---------------------------------------------------------
+# ticker.info(quoteSummary/crumb 인증)는 클라우드 IP에서 거의 항상 실패하는데,
+# 실패로 판정되기까지 내부적으로 수십 초를 소모하는 경우가 많다(첫 조회하는
+# 종목마다 체감 지연의 가장 큰 원인). 요청 처리 스레드가 그 시간을 그대로
+# 떠안지 않도록, 별도 스레드풀에서 실행하고 정해진 시간 안에 끝나지 않으면
+# 결과를 기다리지 않고 바로 포기(타임아웃)하고 폴백으로 넘어간다. 뒤에서
+# 돌던 호출 자체는 스레드풀에서 계속 실행되다가 알아서 끝난다(응답은 버려짐).
+# ---------------------------------------------------------
+_bg_executor = concurrent.futures.ThreadPoolExecutor(max_workers=16)
+_INFO_CALL_TIMEOUT = 5  # 초. crumb 인증이 이 시간 안에 안 끝나면 포기.
+
+
+def _call_with_timeout(fn, timeout, *args, **kwargs):
+    """fn을 별도 스레드에서 실행하고 timeout 안에 안 끝나면 TimeoutError를 던진다.
+    (fn 자체는 백그라운드에서 계속 실행되다가 알아서 종료됨 - 응답만 포기)"""
+    future = _bg_executor.submit(fn, *args, **kwargs)
+    return future.result(timeout=timeout)
+
 
 def _throttle_yahoo_call():
     global _yahoo_last_call_ts
@@ -495,8 +513,11 @@ def get_foreign_name(symbol: str, ticker: "yf.Ticker" = None):
 
         try:
             t = ticker or yf.Ticker(symbol, session=session)
-            info = _yahoo_call_with_retry(lambda: t.info)
+            info = _call_with_timeout(lambda: _yahoo_call_with_retry(lambda: t.info), _INFO_CALL_TIMEOUT)
             name = info.get('longName') or info.get('shortName')
+        except concurrent.futures.TimeoutError:
+            print(f"[해외 종목명 조회 타임아웃] {symbol}: {_INFO_CALL_TIMEOUT}초 초과")
+            name = entry['name'] if entry else None
         except Exception as e:
             print(f"[해외 종목명 조회 실패] {symbol}: {e}")
             name = entry['name'] if entry else None
@@ -559,9 +580,16 @@ def fetch_fundamentals(ticker: "yf.Ticker") -> dict:
     거의 항상 'Invalid Crumb'로 거부된다. 재시도/수동 crumb 폴백 모두 결국 실패하는데
     시간만 잡아먹어(요청당 수십 초 -> 게이트웨이 타임아웃 원인) retries=0으로 1회만
     시도하고, 실패하면 바로 포기해서 pykrx/DART/Finnhub 같은 살아있는 폴백에
-    빨리 넘어가도록 한다."""
+    빨리 넘어가도록 한다. 게다가 실패 판정 자체가 느릴 수 있어(내부적으로 수십 초)
+    _INFO_CALL_TIMEOUT 안에 응답이 없으면 기다리지 않고 바로 포기한다."""
     try:
-        info = _yahoo_call_with_retry(lambda: ticker.info or {}, retries=0)
+        info = _call_with_timeout(
+            lambda: _yahoo_call_with_retry(lambda: ticker.info or {}, retries=0),
+            _INFO_CALL_TIMEOUT,
+        )
+    except concurrent.futures.TimeoutError:
+        print(f"[재무지표 조회 타임아웃] {ticker.ticker}: {_INFO_CALL_TIMEOUT}초 초과, 폴백으로 넘어감")
+        info = {}
     except Exception as e:
         print(f"[재무지표 조회 실패 - ticker.info] {ticker.ticker}: {e}")
         info = {}
@@ -599,9 +627,10 @@ def fetch_fundamentals(ticker: "yf.Ticker") -> dict:
 
 def fetch_annual_financials(ticker: "yf.Ticker") -> list:
     """최근 4개년 매출액/영업이익 조회 (연간 손익계산서 기준).
-    ETF 등 손익계산서가 없는 종목은 빈 리스트를 반환한다."""
+    ETF 등 손익계산서가 없는 종목은 빈 리스트를 반환한다. ticker.info와 마찬가지로
+    이 호출도 클라우드 IP에서 느리게 실패할 수 있어 타임아웃을 씌운다."""
     try:
-        fin = _yahoo_call_with_retry(lambda: ticker.financials)
+        fin = _call_with_timeout(lambda: _yahoo_call_with_retry(lambda: ticker.financials), _INFO_CALL_TIMEOUT)
         if fin is None or fin.empty:
             return []
 
