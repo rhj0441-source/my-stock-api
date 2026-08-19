@@ -1041,7 +1041,12 @@ def get_yahoo_name_fast(query: str, count: int = 1):
 
 
 def fetch_yahoo_quick_quote(yahoo_symbol: str, period: str) -> dict:
-    """fast_info + history만 사용 (인증 불필요, 빠름). PER/PBR/재무제표는 아예 조회하지 않는다."""
+    """fast_info + history만 사용 (인증 불필요, 빠름). PER/PBR/재무제표는 아예 조회하지 않는다.
+
+    history() 호출 시 actions=True를 켜면 배당/액면분할 이력이 같은 응답(같은 chart API
+    호출)에 함께 실려오고, 호출 직후 ticker.history_metadata로 그 chart API 응답의 meta
+    블록(프리마켓/애프터마켓 시세, 기준 시각, 정식 거래소명 등)을 추가 요청 없이 그대로
+    읽을 수 있다 - 네트워크 왕복을 늘리지 않고 정보만 더 뽑아내는 방식."""
     ticker = yf.Ticker(yahoo_symbol, session=session)
 
     fi = _yahoo_call_with_retry(lambda: ticker.fast_info)
@@ -1053,11 +1058,19 @@ def fetch_yahoo_quick_quote(yahoo_symbol: str, period: str) -> dict:
     change = current_price - previous_close if previous_close else 0
     change_percent = (change / previous_close) * 100 if previous_close else 0
 
-    history = _yahoo_call_with_retry(ticker.history, period=_PERIOD_MAP.get(period, '1mo'))
+    history = _yahoo_call_with_retry(
+        ticker.history, period=_PERIOD_MAP.get(period, '1mo'), actions=True
+    )
     chart_data = [
         {"date": date.strftime('%Y-%m-%d'), "close": round(row['Close'], 2), "volume": int(row['Volume'])}
         for date, row in history.iterrows()
     ]
+
+    # history() 호출 직후에만 채워짐 - 추가 HTTP 요청 없이 같은 응답의 meta를 재사용
+    try:
+        meta = ticker.history_metadata or {}
+    except Exception:
+        meta = {}
 
     def _safe(attr):
         try:
@@ -1065,6 +1078,24 @@ def fetch_yahoo_quick_quote(yahoo_symbol: str, period: str) -> dict:
             return None if _is_nan(v) else v
         except Exception:
             return None
+
+    def _meta(key):
+        v = meta.get(key)
+        return None if _is_nan(v) else v
+
+    # 배당/액면분할 이력 (history의 Dividends/Stock Splits 컬럼에서 0이 아닌 행만 추출)
+    dividends = []
+    if 'Dividends' in history.columns:
+        for date, amount in history['Dividends'].items():
+            if amount:
+                dividends.append({"date": date.strftime('%Y-%m-%d'), "amount": round(float(amount), 4)})
+    splits = []
+    if 'Stock Splits' in history.columns:
+        for date, ratio in history['Stock Splits'].items():
+            if ratio:
+                splits.append({"date": date.strftime('%Y-%m-%d'), "ratio": float(ratio)})
+
+    has_pre_post = bool(_meta('hasPrePostMarketData'))
 
     return {
         'currentPrice': current_price,
@@ -1089,6 +1120,22 @@ def fetch_yahoo_quick_quote(yahoo_symbol: str, period: str) -> dict:
         'fiftyDayAvg': _safe('fifty_day_average'),
         'twoHundredDayAvg': _safe('two_hundred_day_average'),
         'chart': chart_data,
+        # --- 아래는 추가 요청 없이 meta/actions에서 더 뽑아낸 값들 ---
+        'fullExchangeName': _meta('fullExchangeName'),
+        'regularMarketTime': _meta('regularMarketTime'),  # unix epoch(초). 프론트에서 표시용으로 변환.
+        'hasPrePostMarketData': has_pre_post,
+        'preMarketPrice': _meta('preMarketPrice') if has_pre_post else None,
+        # 주의: fast_info/quoteSummary의 다른 %값들과 달리 chart meta의 이 필드는
+        # 이미 "퍼센트" 단위(예: -1.23)로 오는지 소수 비율(예: -0.0123)로 오는지
+        # 실제 응답으로 한 번 찍어서 확인 필요. 일단 원시값 그대로 내려보내고,
+        # 프론트에서 화면에 찍어본 뒤 배율이 이상하면 여기서 * 100 여부만 조정하면 됨.
+        'preMarketChangePercent': _meta('preMarketChangePercent') if has_pre_post else None,
+        'preMarketTime': _meta('preMarketTime') if has_pre_post else None,
+        'postMarketPrice': _meta('postMarketPrice') if has_pre_post else None,
+        'postMarketChangePercent': _meta('postMarketChangePercent') if has_pre_post else None,
+        'postMarketTime': _meta('postMarketTime') if has_pre_post else None,
+        'dividends': dividends[-5:],  # 최근 5건만
+        'splits': splits[-5:],
     }
 
 
