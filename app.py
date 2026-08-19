@@ -1083,6 +1083,22 @@ def fetch_yahoo_quick_quote(yahoo_symbol: str, period: str) -> dict:
         v = meta.get(key)
         return None if _is_nan(v) else v
 
+    def _meta_epoch_ms(key):
+        """meta의 시각 필드는 yfinance 버전/필드에 따라 raw 야후 응답처럼 초 단위
+        정수로 오기도 하고, yfinance가 내부적으로 datetime/pandas Timestamp로
+        미리 변환해두기도 한다. Flask jsonify는 datetime을 문자열로 직렬화해버려서
+        프론트에서 그대로 곱셈하면 깨지므로(Invalid Date), 여기서 항상 int(밀리초)로
+        통일해서 내려보낸다."""
+        v = meta.get(key)
+        if v is None:
+            return None
+        try:
+            if hasattr(v, 'timestamp'):  # datetime / pandas Timestamp
+                return int(v.timestamp() * 1000)
+            return int(float(v) * 1000)  # 초 단위 unix epoch 숫자
+        except Exception:
+            return None
+
     # 배당/액면분할 이력 (history의 Dividends/Stock Splits 컬럼에서 0이 아닌 행만 추출)
     dividends = []
     if 'Dividends' in history.columns:
@@ -1122,7 +1138,7 @@ def fetch_yahoo_quick_quote(yahoo_symbol: str, period: str) -> dict:
         'chart': chart_data,
         # --- 아래는 추가 요청 없이 meta/actions에서 더 뽑아낸 값들 ---
         'fullExchangeName': _meta('fullExchangeName'),
-        'regularMarketTime': _meta('regularMarketTime'),  # unix epoch(초). 프론트에서 표시용으로 변환.
+        'regularMarketTime': _meta_epoch_ms('regularMarketTime'),  # epoch 밀리초(int). 프론트에서 그대로 new Date()에 사용.
         'hasPrePostMarketData': has_pre_post,
         'preMarketPrice': _meta('preMarketPrice') if has_pre_post else None,
         # 주의: fast_info/quoteSummary의 다른 %값들과 달리 chart meta의 이 필드는
@@ -1130,10 +1146,10 @@ def fetch_yahoo_quick_quote(yahoo_symbol: str, period: str) -> dict:
         # 실제 응답으로 한 번 찍어서 확인 필요. 일단 원시값 그대로 내려보내고,
         # 프론트에서 화면에 찍어본 뒤 배율이 이상하면 여기서 * 100 여부만 조정하면 됨.
         'preMarketChangePercent': _meta('preMarketChangePercent') if has_pre_post else None,
-        'preMarketTime': _meta('preMarketTime') if has_pre_post else None,
+        'preMarketTime': _meta_epoch_ms('preMarketTime') if has_pre_post else None,
         'postMarketPrice': _meta('postMarketPrice') if has_pre_post else None,
         'postMarketChangePercent': _meta('postMarketChangePercent') if has_pre_post else None,
-        'postMarketTime': _meta('postMarketTime') if has_pre_post else None,
+        'postMarketTime': _meta_epoch_ms('postMarketTime') if has_pre_post else None,
         'dividends': dividends[-5:],  # 최근 5건만
         'splits': splits[-5:],
     }
