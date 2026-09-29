@@ -3,7 +3,7 @@ import re
 import time
 import threading
 import concurrent.futures
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify as _flask_jsonify, request
 from flask_cors import CORS
 import yfinance as yf
 from yfinance import EquityQuery
@@ -11,6 +11,23 @@ from curl_cffi import requests as requests_cffi
 
 app = Flask(__name__)
 CORS(app)
+
+
+def _clean_nan(obj):
+    """응답에 담기는 NaN/Infinity를 None(null)로 치환한다.
+    NaN/Infinity는 유효한 JSON이 아니라서 브라우저의 response.json()이 SyntaxError를
+    던지기 때문에(프론트에서 '추출 실패'로 보임), 내보내기 직전에 항상 정리한다."""
+    if isinstance(obj, float):
+        return obj if (obj == obj and obj not in (float('inf'), float('-inf'))) else None
+    if isinstance(obj, dict):
+        return {k: _clean_nan(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_clean_nan(v) for v in obj]
+    return obj
+
+
+def jsonify(data):
+    return _flask_jsonify(_clean_nan(data))
 
 # 차단 우회를 위한 브라우저 세션 생성 (Chrome 브라우저 위장, 해외 종목 조회에 사용)
 session = requests_cffi.Session(impersonate="chrome110")
@@ -702,6 +719,8 @@ def fetch_yahoo_quote(yahoo_symbol: str, period: str, light: bool = False) -> di
     change = current_price - previous_close if previous_close else 0
     change_percent = (change / previous_close) * 100 if previous_close else 0
 
+    # 장 마감 전 최신 일봉 등 종가가 비어있는(NaN) 행은 차트에서 제외
+    history = history.dropna(subset=['Close'])
     chart_data = [
         {"date": date.strftime('%Y-%m-%d'), "close": round(row['Close'], 2)}
         for date, row in history.iterrows()
@@ -1061,8 +1080,14 @@ def fetch_yahoo_quick_quote(yahoo_symbol: str, period: str) -> dict:
     history = _yahoo_call_with_retry(
         ticker.history, period=_PERIOD_MAP.get(period, '1mo'), actions=True
     )
+    # 종가가 비어있는(NaN) 행은 제외하고, 거래량이 NaN이면 0으로 처리 (int(NaN)은 예외)
+    history = history.dropna(subset=['Close'])
     chart_data = [
-        {"date": date.strftime('%Y-%m-%d'), "close": round(row['Close'], 2), "volume": int(row['Volume'])}
+        {
+            "date": date.strftime('%Y-%m-%d'),
+            "close": round(row['Close'], 2),
+            "volume": 0 if _is_nan(row['Volume']) else int(row['Volume']),
+        }
         for date, row in history.iterrows()
     ]
 
